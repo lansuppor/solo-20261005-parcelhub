@@ -94,6 +94,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdFreeze(dataFile, rest[1:], stdout, stderr)
 	case "unfreeze":
 		return cmdUnfreeze(dataFile, rest[1:], stdout, stderr)
+	case "abort":
+		return cmdAbort(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -131,6 +133,7 @@ func printHelp(w io.Writer) {
   batch                  按批次号查询成员、配送员、出站时间与逐件回执进度
   freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
+  abort                  配送批次中止：未回执包裹全部收回出发站，批次永久关闭
 
 常用示例:
   %s register --id P001 --station 站点A
@@ -146,10 +149,11 @@ func printHelp(w io.Writer) {
   %s batch    --id B1
   %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
   %s unfreeze --request U1 --incident E1 --note 已核实放行
+  %s abort    --request A1 --batch B1 --reason 车辆故障全部收回
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -179,7 +183,8 @@ func printQueryHelp(w io.Writer) {
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
 与请求号；冻结记录显示异常单号、原因、站点和时间；解除冻结记录
-显示异常单号、解除请求号、处理说明和时间。包裹不存在时报错，不会创建记录。
+显示异常单号、解除请求号、处理说明和时间；收回记录显示批次号、
+中止请求号、原因、站点和时间。包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -323,7 +328,9 @@ func printBatchHelp(w io.Writer) {
   %s batch [--data FILE] --id 批次号
 
 展示批次原成员（按首次提交顺序）、配送员、出发站、出站时间、
-逐件回执与未回执项，以及批次是否完成。批次不存在时报错。
+逐件回执与未回执项，以及批次状态（配送中 / 已完成 / 已中止）。
+已中止批次同时展示中止请求号、原因与时间，收回成员标注为“已收回”
+（不列为未回执待处理），已回执成员的真实回执照常展示。批次不存在时报错。
 
 示例:
   %s batch --id B1
@@ -353,6 +360,34 @@ func printFreezeHelp(w io.Writer) {
 
 示例:
   %s freeze --incident E1 --parcel P001 --station 站点A --reason 外包装破损
+`, appName, appName, appName)
+}
+
+func printAbortHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s abort — 配送批次中止（未回执包裹全部收回出发站）
+
+用法:
+  %s abort [--data FILE] --request 中止请求号 --batch 批次号 --reason 中止原因
+
+规则:
+  - 中止请求号、批次号、中止原因均去除两端空白，不可为空或仅含空白
+  - 成员与站点取自原批次结果，不允许另选成员或站点
+  - 首次中止：批次必须存在、尚未完成且未中止，且至少有一件未回执成员；
+    这些成员必须仍在原批次配送中、归属出发站，任一不符整批拒绝
+  - 已回执成员及其回执完全保留，即使它们已进入其他批次或被冻结也不阻止中止
+  - 成功时按原成员顺序将全部未回执件恢复“在站”（站点为出发站），各追加一条
+    含批次、中止请求号、原因、站点和时间的收回记录；收回不是失败回执
+  - 中止永久关闭原批次，原成员顺序、配送员与出站时间保留不变；
+    每批只能成功中止一次，换请求号再中止或中止已完成批次均拒绝
+  - 收回算新的流转：收回后不能退回出站前的旧交接；收回件可交接、冻结或
+    再次出站，但不能首次回执旧批次（receipt 与 receipt-import 同样遵守）
+  - 中止请求号独立去重，可与批次号、包裹号及其他业务编号同名：
+    相同请求号且批次、清理后的原因相同，直接返回首次收回集合与时间，
+    不重新计算成员、不检查当前状态、不改写台账；换批次或原因报冲突；
+    失败的首次中止不占用请求号
+
+示例:
+  %s abort --request A1 --batch B1 --reason 车辆故障全部收回
 `, appName, appName, appName)
 }
 

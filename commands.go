@@ -133,6 +133,9 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		case "解除冻结":
 			fmt.Fprintf(stdout, "  %d. 操作: 解除冻结    站点: %s    异常单号: %s    解除请求号: %s    处理说明: %s    时间: %s\n",
 				i+1, e.Station, e.Incident, e.Request, e.Note, e.Time.Format(timeFmt))
+		case "收回":
+			fmt.Fprintf(stdout, "  %d. 操作: 收回    站点: %s    批次号: %s    中止请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Station, e.Batch, e.Request, e.Reason, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -579,12 +582,26 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	if b.Done() {
 		status = "已完成"
 	}
-	fmt.Fprintf(stdout, "批次号: %s\n出发站: %s\n配送员: %s\n出站时间: %s\n批次状态: %s\n逐件回执（%d/%d 已回执）:\n",
-		b.Batch, b.Station, b.Courier, b.Time.Format(timeFmt), status, len(b.Receipts), len(b.Parcels))
+	ab := store.BatchAbort(cleanIDVal)
+	if ab != nil {
+		status = "已中止"
+	}
+	fmt.Fprintf(stdout, "批次号: %s\n出发站: %s\n配送员: %s\n出站时间: %s\n批次状态: %s\n",
+		b.Batch, b.Station, b.Courier, b.Time.Format(timeFmt), status)
+	if ab != nil {
+		fmt.Fprintf(stdout, "中止请求号: %s\n中止原因: %s\n中止时间: %s\n",
+			ab.Request, ab.Reason, ab.Time.Format(timeFmt))
+	}
+	fmt.Fprintf(stdout, "逐件回执（%d/%d 已回执）:\n", len(b.Receipts), len(b.Parcels))
 	for _, pid := range b.Parcels {
 		e, ok := b.Receipts[pid]
 		if !ok {
-			fmt.Fprintf(stdout, "  - %s    未回执\n", pid)
+			if ab != nil {
+				fmt.Fprintf(stdout, "  - %s    已收回    中止请求号: %s    原因: %s    时间: %s\n",
+					pid, ab.Request, ab.Reason, ab.Time.Format(timeFmt))
+			} else {
+				fmt.Fprintf(stdout, "  - %s    未回执\n", pid)
+			}
 			continue
 		}
 		if e.Result == resultFailed {
@@ -695,5 +712,55 @@ func cmdUnfreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	cur, _ := store.Query(res.Parcel)
 	fmt.Fprintf(stdout, "%s\n解除请求号: %s\n异常单号: %s\n包裹编号: %s\n当前状态: %s\n处理说明: %s\n发生时间: %s\n",
 		headline, res.Request, res.Incident, res.Parcel, cur.Status, res.Note, res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("abort", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "中止请求号（独立去重）")
+	batch := fs.String("batch", "", "要中止的配送批次号")
+	reason := fs.String("reason", "", "中止原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printAbortHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("中止请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanBatch, err := cleanID("批次号", *batch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("中止原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
+		return exitBusiness
+	}
+	res, replayed, err := store.Abort(cleanReq, cleanBatch, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "中止成功"
+	if replayed {
+		headline = "中止成功（中止请求号重复提交，返回首次保存的结果，未再追加收回记录）"
+	}
+	fmt.Fprintf(stdout, "%s\n中止请求号: %s\n批次号: %s\n出发站: %s\n中止原因: %s\n收回包裹（%d 件）:\n",
+		headline, res.Request, res.Batch, res.Station, res.Reason, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
 	return exitOK
 }
