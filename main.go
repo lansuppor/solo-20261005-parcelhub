@@ -80,6 +80,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdQuery(dataFile, rest[1:], stdout, stderr)
 	case "handoff":
 		return cmdHandoff(dataFile, rest[1:], stdout, stderr)
+	case "return":
+		return cmdReturn(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -110,16 +112,18 @@ func printHelp(w io.Writer) {
   register               单件收件登记，登记后包裹状态为“在站”
   query                  按包裹编号查询当前站点、状态与完整轨迹
   handoff                一次提交多件包裹的站点交接；成功后包裹直接归属目的站点
+  return                 按原交接整批退回，实物送回该交接的源站点
 
 常用示例:
   %s register --id P001 --station 站点A
   %s query    --id P001
   %s handoff  --request R1 --from 站点A --to 站点B \
               --parcel P001 --parcel P002
+  %s return   --request RT1 --handoff R1 --reason 错发站点
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -145,7 +149,8 @@ func printQueryHelp(w io.Writer) {
   %s query [--data FILE] --id 包裹编号
 
 展示当前站点、当前状态及按提交顺序排列的完整轨迹；
-交接记录同时显示请求号。包裹不存在时报错，不会创建记录。
+交接记录同时显示请求号；退回记录同时显示源站、目的站、
+退回请求号、被退回的原交接请求号与原因。包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -171,5 +176,30 @@ func printHandoffHelp(w io.Writer) {
 
 示例:
   %s handoff --request R1 --from 站点A --to 站点B --parcel P001 --parcel P002
+`, appName, appName, appName)
+}
+
+func printReturnHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s return — 按原交接整批退回（实物送回该交接的源站点）
+
+用法:
+  %s return [--data FILE] --request 退回请求号 --handoff 原交接请求号 --reason 退回原因
+
+规则:
+  - 退回请求号、原交接请求号、退回原因均去除两端空白，不可为空或仅含空白
+  - 批次与站点取自原交接结果，不允许另选包裹或目的站
+  - 首次退回：原交接必须存在且尚未成功退回；批次中每件包裹必须仍在
+    原交接目的站、状态为在站，且最后一条流转记录就是该原交接
+    （包裹经其他交接又回到同一站点的，不能退回旧交接；请求重放不算新流转）
+  - 任一条件不满足则整批拒绝，其他包裹与已有请求结果不变
+  - 成功时整批改归原交接源站（仍为“在站”），每件按提交顺序追加一条
+    退回记录，原收件、交接轨迹保留不变；每个原交接只能成功退回一次
+  - 退回请求号与交接请求号分属独立去重范围，允许同名：
+    相同退回请求号且原交接、原因相同，直接返回首次结果，不再追加轨迹，
+    即使包裹之后又被交接也照常重放；请求号相同但原交接或原因不同报冲突；
+    失败的首次退回不占用请求号
+
+示例:
+  %s return --request RT1 --handoff R1 --reason 错发站点
 `, appName, appName, appName)
 }

@@ -22,6 +22,7 @@ func TestHelpVariants(t *testing.T) {
 		{"help"},
 		{"register", "--help"},
 		{"handoff", "-h"},
+		{"return", "--help"},
 	} {
 		var out, errb bytes.Buffer
 		code := run(args, &out, &errb)
@@ -160,5 +161,106 @@ func TestCLIValidationFailures(t *testing.T) {
 		if code != exitBusiness || !strings.Contains(errb.String(), c.errSub) {
 			t.Fatalf("%v 应失败(1)且提示 %q，得到 code=%d err=%q", c.args, c.errSub, code, errb.String())
 		}
+	}
+}
+
+func TestCLIEndToEndReturn(t *testing.T) {
+	dbPath := t.TempDir() + "/ledger.json"
+
+	runCLI(t, dbPath, "register", "--id", "P001", "--station", "站点A")
+	runCLI(t, dbPath, "register", "--id", "P002", "--station", "站点A")
+	out, _, code := runCLI(t, dbPath, "handoff",
+		"--request", "R1", "--from", "站点A", "--to", "站点B",
+		"--parcel", "P001", "--parcel", "P002")
+	if code != 0 {
+		t.Fatalf("交接失败: code=%d", code)
+	}
+
+	// 整批退回：输出可辨认源站、目的站、原因、两个请求号与全体包裹。
+	out, _, code = runCLI(t, dbPath, "return", "--request", "RT1", "--handoff", "R1", "--reason", "错发站点")
+	if code != 0 || !strings.Contains(out, "退回成功") ||
+		!strings.Contains(out, "退回请求号: RT1") || !strings.Contains(out, "原交接请求号: R1") ||
+		!strings.Contains(out, "源站点: 站点B") || !strings.Contains(out, "目的站点: 站点A") ||
+		!strings.Contains(out, "退回原因: 错发站点") ||
+		!strings.Contains(out, "- P001") || !strings.Contains(out, "- P002") {
+		t.Fatalf("退回输出不符: code=%d out=%s", code, out)
+	}
+
+	// 查询展示退回的源站、目的站、时间、原因、两个请求号，且原轨迹保留。
+	out, _, code = runCLI(t, dbPath, "query", "--id", "P001")
+	if code != 0 || !strings.Contains(out, "当前站点: 站点A") ||
+		!strings.Contains(out, "1. 操作: 收件") || !strings.Contains(out, "2. 操作: 交接") ||
+		!strings.Contains(out, "3. 操作: 退回") ||
+		!strings.Contains(out, "源站: 站点B") || !strings.Contains(out, "目的站: 站点A") ||
+		!strings.Contains(out, "退回请求号: RT1") || !strings.Contains(out, "原交接请求号: R1") ||
+		!strings.Contains(out, "原因: 错发站点") {
+		t.Fatalf("退回轨迹展示不符: code=%d out=%s", code, out)
+	}
+
+	// 同退回请求号、同原交接、同原因：重放首次结果，不追加轨迹。
+	out, _, code = runCLI(t, dbPath, "return", "--request", "RT1", "--handoff", "R1", "--reason", "错发站点")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("重复退回应重放: code=%d out=%s", code, out)
+	}
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P001")
+	if strings.Count(out, "操作: 退回") != 1 {
+		t.Fatalf("重放不得追加退回轨迹:\n%s", out)
+	}
+
+	// 同退回请求号换原因：冲突。
+	_, errText, code := runCLI(t, dbPath, "return", "--request", "RT1", "--handoff", "R1", "--reason", "别的原因")
+	if code != exitBusiness || !strings.Contains(errText, "冲突") {
+		t.Fatalf("退回请求号内容冲突应失败: code=%d err=%s", code, errText)
+	}
+
+	// 换退回请求号再次退回同一原交接：失败。
+	_, errText, code = runCLI(t, dbPath, "return", "--request", "RT2", "--handoff", "R1", "--reason", "再退")
+	if code != exitBusiness || !strings.Contains(errText, "不能再次退回") {
+		t.Fatalf("已退回的原交接再次退回应失败: code=%d err=%s", code, errText)
+	}
+
+	// 原 handoff 请求同内容重放照常，不重新移动包裹。
+	out, _, code = runCLI(t, dbPath, "handoff",
+		"--request", "R1", "--from", "站点A", "--to", "站点B",
+		"--parcel", "P001", "--parcel", "P002")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("已退回的原交接重放应返回首次结果: code=%d out=%s", code, out)
+	}
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P001")
+	if !strings.Contains(out, "当前站点: 站点A") || strings.Count(out, "操作: 交接") != 1 {
+		t.Fatalf("交接重放不得重新移动包裹:\n%s", out)
+	}
+}
+
+func TestCLIReturnValidation(t *testing.T) {
+	dbPath := t.TempDir() + "/ledger.json"
+	runCLI(t, dbPath, "register", "--id", "P001", "--station", "站点A")
+	runCLI(t, dbPath, "handoff", "--request", "R1", "--from", "站点A", "--to", "站点B", "--parcel", "P001")
+
+	cases := []struct {
+		args   []string
+		errSub string
+	}{
+		{[]string{"return", "--request", "  ", "--handoff", "R1", "--reason", "x"}, "不可为空"},
+		{[]string{"return", "--request", "RT1", "--handoff", "", "--reason", "x"}, "不可为空"},
+		{[]string{"return", "--request", "RT1", "--handoff", "R1", "--reason", " \t "}, "不可为空"},
+		{[]string{"return", "--request", "RT1", "--handoff", "NOPE", "--reason", "x"}, "不存在"},
+	}
+	for _, c := range cases {
+		var out, errb bytes.Buffer
+		full := append([]string{"--data", dbPath}, c.args...)
+		code := run(full, &out, &errb)
+		if code != exitBusiness || !strings.Contains(errb.String(), c.errSub) {
+			t.Fatalf("%v 应失败(1)且提示 %q，得到 code=%d err=%q", c.args, c.errSub, code, errb.String())
+		}
+	}
+	// 空白清洗后等价的提交应视为同一请求（此处首次成功，再次提交为重放）。
+	out, _, code := runCLI(t, dbPath, "return", "--request", " RT1 ", "--handoff", " R1 ", "--reason", " 错发 ")
+	if code != 0 || !strings.Contains(out, "退回成功") {
+		t.Fatalf("两端空白应被清洗后成功: code=%d out=%s", code, out)
+	}
+	out, _, code = runCLI(t, dbPath, "return", "--request", "RT1", "--handoff", "R1", "--reason", "错发")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("清洗后同内容应重放: code=%d out=%s", code, out)
 	}
 }

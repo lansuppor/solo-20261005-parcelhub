@@ -104,6 +104,11 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "包裹编号: %s\n当前站点: %s\n当前状态: %s\n轨迹（按提交顺序，共 %d 条）:\n",
 		p.ID, p.Station, p.Status, len(p.Trail))
 	for i, e := range p.Trail {
+		if e.Op == "退回" {
+			fmt.Fprintf(stdout, "  %d. 操作: 退回    源站: %s    目的站: %s    退回请求号: %s    原交接请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.From, e.Station, e.Request, e.RefRequest, e.Reason, e.Time.Format(timeFmt))
+			continue
+		}
 		req := e.Request
 		if req == "" {
 			req = "-"
@@ -182,6 +187,56 @@ func cmdHandoff(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "%s\n请求号: %s\n源站点: %s\n目的站点: %s\n包裹（%d 件）:\n",
 		headline, result.Request, result.From, result.To, len(result.Parcels))
+	for _, id := range result.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", result.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReturn(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("return", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "退回请求号（用于去重）")
+	handoff := fs.String("handoff", "", "被退回的原交接请求号")
+	reason := fs.String("reason", "", "退回原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReturnHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("退回请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanHandoff, err := cleanID("原交接请求号", *handoff)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("退回原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
+		return exitBusiness
+	}
+	result, replayed, err := store.Return(cleanReq, cleanHandoff, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "退回成功"
+	if replayed {
+		headline = "退回成功（请求号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n退回请求号: %s\n原交接请求号: %s\n源站点: %s\n目的站点: %s\n退回原因: %s\n包裹（%d 件）:\n",
+		headline, result.Request, result.Handoff, result.From, result.To, result.Reason, len(result.Parcels))
 	for _, id := range result.Parcels {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
