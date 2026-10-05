@@ -106,6 +106,13 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintf(stdout, "包裹编号: %s\n当前站点: %s\n当前状态: %s\n", p.ID, p.Station, p.Status)
+	if p.Status == statusDelivering {
+		if cb := currentBatch(p); cb != "" {
+			if b, err := store.BatchQuery(cb); err == nil {
+				fmt.Fprintf(stdout, "当前批次: %s    配送员: %s\n", cb, b.Courier)
+			}
+		}
+	}
 	if f := store.ActiveFreeze(cleanIDVal); f != nil {
 		fmt.Fprintf(stdout, "当前未解除异常: 异常单号: %s    原因: %s    冻结时间: %s\n",
 			f.Incident, f.Reason, f.Time.Format(timeFmt))
@@ -136,6 +143,9 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		case "收回":
 			fmt.Fprintf(stdout, "  %d. 操作: 收回    站点: %s    批次号: %s    中止请求号: %s    原因: %s    时间: %s\n",
 				i+1, e.Station, e.Batch, e.Request, e.Reason, e.Time.Format(timeFmt))
+		case "续接":
+			fmt.Fprintf(stdout, "  %d. 操作: 续接    站点: %s    原批次号: %s    新批次号: %s    新配送员: %s    续接请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Station, e.FromBatch, e.Batch, e.Courier, e.Request, e.Reason, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -586,11 +596,24 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	if ab != nil {
 		status = "已中止"
 	}
+	tr := store.BatchTransfer(cleanIDVal)
+	if tr != nil {
+		status = "已转交"
+	}
+	origin := store.BatchOrigin(cleanIDVal)
 	fmt.Fprintf(stdout, "批次号: %s\n出发站: %s\n配送员: %s\n出站时间: %s\n批次状态: %s\n",
 		b.Batch, b.Station, b.Courier, b.Time.Format(timeFmt), status)
+	if origin != nil {
+		fmt.Fprintf(stdout, "批次来源: 续接自批次 %s（续接请求号: %s，原配送员: %s）\n接手时间: %s\n",
+			origin.FromBatch, origin.Request, origin.FromCourier, origin.Time.Format(timeFmt))
+	}
 	if ab != nil {
 		fmt.Fprintf(stdout, "中止请求号: %s\n中止原因: %s\n中止时间: %s\n",
 			ab.Request, ab.Reason, ab.Time.Format(timeFmt))
+	}
+	if tr != nil {
+		fmt.Fprintf(stdout, "转交去向: 批次 %s（续接请求号: %s，新配送员: %s）\n转交时间: %s\n",
+			tr.ToBatch, tr.Request, tr.ToCourier, tr.Time.Format(timeFmt))
 	}
 	fmt.Fprintf(stdout, "逐件回执（%d/%d 已回执）:\n", len(b.Receipts), len(b.Parcels))
 	for _, pid := range b.Parcels {
@@ -599,6 +622,9 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			if ab != nil {
 				fmt.Fprintf(stdout, "  - %s    已收回    中止请求号: %s    原因: %s    时间: %s\n",
 					pid, ab.Request, ab.Reason, ab.Time.Format(timeFmt))
+			} else if tr != nil {
+				fmt.Fprintf(stdout, "  - %s    已转交    新批次号: %s    续接请求号: %s    时间: %s\n",
+					pid, tr.ToBatch, tr.Request, tr.Time.Format(timeFmt))
 			} else {
 				fmt.Fprintf(stdout, "  - %s    未回执\n", pid)
 			}
@@ -762,5 +788,71 @@ func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReassign(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("reassign", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "续接请求号（独立去重）")
+	batch := fs.String("batch", "", "原配送批次号")
+	newBatch := fs.String("new-batch", "", "新配送批次号（从未被出站或续接使用）")
+	courier := fs.String("courier", "", "新配送员（必须与原配送员不同）")
+	reason := fs.String("reason", "", "续接原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReassignHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("续接请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanBatch, err := cleanID("原批次号", *batch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanNewBatch, err := cleanID("新批次号", *newBatch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanCourier, err := cleanID("新配送员", *courier)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("续接原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	if cleanBatch == cleanNewBatch {
+		fmt.Fprintf(stderr, "%s reassign: 原批次号与新批次号不能相同（均为 %q）\n", appName, cleanBatch)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+	res, replayed, err := store.Reassign(cleanReq, cleanBatch, cleanNewBatch, cleanCourier, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reassign: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "续接成功"
+	if replayed {
+		headline = "续接成功（续接请求号重复提交，返回首次保存的结果，未再追加续接记录）"
+	}
+	fmt.Fprintf(stdout, "%s\n续接请求号: %s\n原批次号: %s\n新批次号: %s\n出发站: %s\n原配送员: %s\n新配送员: %s\n续接原因: %s\n转交包裹（%d 件）:\n",
+		headline, res.Request, res.FromBatch, res.ToBatch, res.Station, res.FromCourier, res.ToCourier, res.Reason, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "接手时间: %s\n", res.Time.Format(timeFmt))
 	return exitOK
 }

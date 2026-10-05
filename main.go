@@ -96,6 +96,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdUnfreeze(dataFile, rest[1:], stdout, stderr)
 	case "abort":
 		return cmdAbort(dataFile, rest[1:], stdout, stderr)
+	case "reassign":
+		return cmdReassign(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -134,6 +136,7 @@ func printHelp(w io.Writer) {
   freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
   abort                  配送批次中止：未回执包裹全部收回出发站，批次永久关闭
+  reassign               配送途中整批续接：未回执包裹交给另一配送员，新建批次继续配送
 
 常用示例:
   %s register --id P001 --station 站点A
@@ -150,10 +153,12 @@ func printHelp(w io.Writer) {
   %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
   %s unfreeze --request U1 --incident E1 --note 已核实放行
   %s abort    --request A1 --batch B1 --reason 车辆故障全部收回
+  %s reassign --request RA1 --batch B1 --new-batch B2 --courier 李四 \
+              --reason 原配送员车辆故障途中交接
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -179,12 +184,13 @@ func printQueryHelp(w io.Writer) {
   %s query [--data FILE] --id 包裹编号
 
 展示当前站点、当前状态、当前未解除异常（若有）及按提交顺序排列的完整轨迹；
-交接记录同时显示请求号；退回记录同时显示源站、目的站、
-退回请求号、被退回的原交接请求号与原因；出站记录同时显示
+配送中包裹同时展示当前批次与配送员。交接记录同时显示请求号；退回记录同时
+显示源站、目的站、退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
 与请求号；冻结记录显示异常单号、原因、站点和时间；解除冻结记录
 显示异常单号、解除请求号、处理说明和时间；收回记录显示批次号、
-中止请求号、原因、站点和时间。包裹不存在时报错，不会创建记录。
+中止请求号、原因、站点和时间；续接记录显示前后批次、新配送员、
+续接请求号、原因、站点和时间。包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -328,9 +334,12 @@ func printBatchHelp(w io.Writer) {
   %s batch [--data FILE] --id 批次号
 
 展示批次原成员（按首次提交顺序）、配送员、出发站、出站时间、
-逐件回执与未回执项，以及批次状态（配送中 / 已完成 / 已中止）。
+逐件回执与未回执项，以及批次状态（配送中 / 已完成 / 已中止 / 已转交）。
 已中止批次同时展示中止请求号、原因与时间，收回成员标注为“已收回”
-（不列为未回执待处理），已回执成员的真实回执照常展示。批次不存在时报错。
+（不列为未回执待处理），已回执成员的真实回执照常展示。
+已转交批次同时展示转交去向（新批次、续接请求号、新配送员）与转交时间，
+转交成员标注为“已转交”（不列为未回执待处理）；续接创建的新批次
+展示批次来源（原批次、续接请求号、原配送员）与接手时间。批次不存在时报错。
 
 示例:
   %s batch --id B1
@@ -413,5 +422,37 @@ func printUnfreezeHelp(w io.Writer) {
 
 示例:
   %s unfreeze --request U1 --incident E1 --note 已核实放行
+`, appName, appName, appName)
+}
+
+func printReassignHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s reassign — 配送途中整批续接（未回执包裹交给另一配送员，新建批次继续配送）
+
+用法:
+  %s reassign [--data FILE] --request 续接请求号 --batch 原批次号 \
+              --new-batch 新批次号 --courier 新配送员 --reason 续接原因
+
+规则:
+  - 续接请求号、原批次号、新批次号、新配送员、续接原因均去除两端空白，不可为空或仅含空白
+  - 成员与站点取自原批次，不允许另选包裹或站点；原批次号与新批次号不能相同
+  - 首次续接：原批次必须存在、仍开放（未中止、未转交、未全部回执完成）且至少有一件
+    未回执成员；新批次号从未被出站或续接使用；新配送员必须与原配送员不同
+  - 未回执件必须全部仍在原批次配送中且归属出发站，任一不符整次拒绝、不作任何改动；
+    已回执成员不检查也不变更，其后续流转或冻结不阻止续接
+  - 成功时新批次按原成员顺序接纳全部未回执件，沿用出发站，记录新配送员及接手时间；
+    包裹保持“配送中”及原站点，当前配送归属切换到新批次，各追加一条续接记录
+  - 原批次永久关闭为“已转交”，保留原成员、配送员、出站时间和真实回执；
+    转交不算回执、收回或再次出站
+  - 转交件不能首次回执旧批次（receipt 与 receipt-import 同样遵守，导入含迟到回执
+    时整份拒绝）；旧批次不能首次中止或再次续接；新批次可回执、导入、中止或再次续接；
+    dispatch 使用续接创建的批次号报冲突
+  - 续接算新的流转：续接后不能退回配送前的旧交接
+  - 续接请求号独立去重，可与批次号、包裹号及其他业务编号同名：
+    相同请求号且原批次、新批次、新配送员、清理后的原因相同，直接返回首次转交集合、
+    续接信息及时间，不检查现状、不重算成员、不改写台账；换内容报冲突；
+    失败的首次续接不占用请求号
+
+示例:
+  %s reassign --request RA1 --batch B1 --new-batch B2 --courier 李四 --reason 原配送员车辆故障途中交接
 `, appName, appName, appName)
 }

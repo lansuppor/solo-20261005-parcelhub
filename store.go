@@ -31,15 +31,16 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回
-	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回为批次出发站）
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接
+	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接为批次出发站）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回请求号（收件、出站记录为空）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接请求号（收件、出站记录为空）
 	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）
-	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）或中止原因（仅收回记录有）
+	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）、中止原因（仅收回记录有）或续接原因（仅续接记录有）
 	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）
-	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回记录有）
-	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站记录有）
+	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回、续接记录有；续接时为新批次号）
+	FromBatch  string    `json:"fromBatch,omitempty"`  // 续接原批次号（仅续接记录有）
+	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站、续接记录有；续接时为新配送员）
 	Result     string    `json:"result,omitempty"`     // 回执结果：签收 | 失败（仅回执记录有）
 	// Incident 为冻结/解除冻结记录的异常单号；解除冻结时另外用 Request 存解除请求号、Note 存处理说明。
 	Incident string `json:"incident,omitempty"`
@@ -95,6 +96,12 @@ type BatchResult struct {
 	Receipts map[string]*ReceiptEntry `json:"receipts"` // 逐件回执，按包裹编号索引（未回执的包裹不在其中）
 	// AbortedBy 为中止该批次的中止请求号（未中止为空）；中止永久生效，批次不得复用。
 	AbortedBy string `json:"abortedBy,omitempty"`
+	// TransferredBy 为把该批次未回执成员整批续接出去的续接请求号（未转交为空）；
+	// 转交永久生效，批次关闭为已转交，不得复用、中止或再次续接。
+	TransferredBy string `json:"transferredBy,omitempty"`
+	// FromReassign 为创建该批次的续接请求号（由 dispatch 创建的批次为空）；
+	// 续接创建的批次号不能用于 dispatch 出站。
+	FromReassign string `json:"fromReassign,omitempty"`
 }
 
 // Done 报告批次是否已完成（全部成员均已回执）。
@@ -145,6 +152,23 @@ type AbortResult struct {
 	Time    time.Time `json:"time"`    // 中止时间
 }
 
+// ReassignResult 记录一次成功的配送途中整批续接，用于续接请求号去重与结果重放。
+// 续接表示原配送员把原批次全部尚未回执的包裹在途中交给另一配送员，新建批次继续配送，
+// 无需回站：原批次永久关闭为已转交，保留原成员、配送员、出站时间和真实回执；
+// 转交不算回执、收回或再次出站。续接请求号独立去重，可与批次号、包裹号及其他业务
+// 编号同名；失败的首次续接不占用请求号。
+type ReassignResult struct {
+	Request     string    `json:"request"`     // 续接请求号
+	FromBatch   string    `json:"fromBatch"`   // 原批次号
+	ToBatch     string    `json:"toBatch"`     // 新批次号
+	Station     string    `json:"station"`     // 出发站（取自原批次，不可另选）
+	FromCourier string    `json:"fromCourier"` // 原配送员（取自原批次）
+	ToCourier   string    `json:"toCourier"`   // 新配送员（必须与原配送员不同）
+	Reason      string    `json:"reason"`      // 清理后的续接原因
+	Parcels     []string  `json:"parcels"`     // 首次转交集合（原批次未回执成员，按原成员顺序）
+	Time        time.Time `json:"time"`        // 接手时间
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
 	Version   int                        `json:"version"`
@@ -156,6 +180,7 @@ type ledgerFile struct {
 	Freezes   map[string]*FreezeResult   `json:"freezes"`   // 以异常单号为键（含已解除的异常单，永久保留）
 	Unfreezes map[string]*UnfreezeResult `json:"unfreezes"` // 以解除请求号为键
 	Aborts    map[string]*AbortResult    `json:"aborts"`    // 以中止请求号为键
+	Reassigns map[string]*ReassignResult `json:"reassigns"` // 以续接请求号为键
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -180,7 +205,8 @@ func Open(path string) (*Store, error) {
 		if os.IsNotExist(err) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
 				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{},
-				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{}}
+				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{},
+				Reassigns: map[string]*ReassignResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -194,7 +220,7 @@ func Open(path string) (*Store, error) {
 	if s.data.Version != 1 || s.data.Parcels == nil || s.data.Handoffs == nil {
 		return nil, fmt.Errorf("%w: 缺少必要字段或版本不受支持", ErrCorrupt)
 	}
-	// 早期版本的数据文件没有 returns/batches/receipts/freeze/abort 相关字段：按空表处理，无需手工修改。
+	// 早期版本的数据文件没有 returns/batches/receipts/freeze/abort/reassign 相关字段：按空表处理，无需手工修改。
 	if s.data.Returns == nil {
 		s.data.Returns = map[string]*ReturnResult{}
 	}
@@ -212,6 +238,9 @@ func Open(path string) (*Store, error) {
 	}
 	if s.data.Aborts == nil {
 		s.data.Aborts = map[string]*AbortResult{}
+	}
+	if s.data.Reassigns == nil {
+		s.data.Reassigns = map[string]*ReassignResult{}
 	}
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
@@ -286,6 +315,29 @@ func (l *ledgerFile) validate() error {
 				}
 				if !inAbort {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹不在中止请求 %q 的收回集合中", ErrCorrupt, id, i+1, e.Request)
+				}
+			}
+			if e.Op == "续接" {
+				if e.Batch == "" || e.FromBatch == "" || e.Courier == "" || e.Request == "" || e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹缺少新批次号、原批次号、新配送员、续接请求号或原因", ErrCorrupt, id, i+1)
+				}
+				r, ok := l.Reassigns[e.Request]
+				if !ok || r == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹引用了不存在的续接请求 %q", ErrCorrupt, id, i+1, e.Request)
+				}
+				if r.FromBatch != e.FromBatch || r.ToBatch != e.Batch || r.ToCourier != e.Courier ||
+					r.Station != e.Station || r.Reason != e.Reason || !r.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹与续接请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				inReassign := false
+				for _, pid := range r.Parcels {
+					if pid == id {
+						inReassign = true
+						break
+					}
+				}
+				if !inReassign {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹不在续接请求 %q 的转交集合中", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
 			if e.Op == "冻结" {
@@ -383,6 +435,18 @@ func (l *ledgerFile) validate() error {
 				return fmt.Errorf("%w: 批次 %q 标记的中止请求号 %q 无法对应", ErrCorrupt, id, b.AbortedBy)
 			}
 		}
+		if b.TransferredBy != "" {
+			r, ok := l.Reassigns[b.TransferredBy]
+			if !ok || r.FromBatch != id {
+				return fmt.Errorf("%w: 批次 %q 标记的续接请求号 %q 无法对应", ErrCorrupt, id, b.TransferredBy)
+			}
+		}
+		if b.FromReassign != "" {
+			r, ok := l.Reassigns[b.FromReassign]
+			if !ok || r.ToBatch != id {
+				return fmt.Errorf("%w: 批次 %q 标记的续接来源请求号 %q 无法对应", ErrCorrupt, id, b.FromReassign)
+			}
+		}
 	}
 	for req, rc := range l.Receipts {
 		if rc == nil || req != rc.Request || rc.Batch == "" || rc.Parcel == "" || rc.Time.IsZero() ||
@@ -444,6 +508,79 @@ func (l *ledgerFile) validate() error {
 			}
 			if !found {
 				return fmt.Errorf("%w: 中止请求号 %q 的收回包裹 %q 缺少对应的收回轨迹", ErrCorrupt, req, pid)
+			}
+		}
+	}
+	// 续接：转交集合必须恰为原批次的未回执成员（按原成员顺序），新批次由该续接创建、
+	// 成员与之一致，且每件转交包裹的轨迹中都有与该续接请求一致的续接记录；
+	// 续接记录与批次及轨迹不一致即损坏。
+	for req, r := range l.Reassigns {
+		if r == nil || req != r.Request || r.FromBatch == "" || r.ToBatch == "" || r.Station == "" ||
+			r.FromCourier == "" || r.ToCourier == "" || r.Reason == "" || len(r.Parcels) == 0 || r.Time.IsZero() {
+			return fmt.Errorf("%w: 续接请求号 %q 的续接结果不完整", ErrCorrupt, req)
+		}
+		if r.FromBatch == r.ToBatch {
+			return fmt.Errorf("%w: 续接请求号 %q 的原批次与新批次相同（%q）", ErrCorrupt, req, r.FromBatch)
+		}
+		if r.FromCourier == r.ToCourier {
+			return fmt.Errorf("%w: 续接请求号 %q 的新配送员与原配送员相同（%q）", ErrCorrupt, req, r.ToCourier)
+		}
+		fb, ok := l.Batches[r.FromBatch]
+		if !ok {
+			return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的原批次 %q", ErrCorrupt, req, r.FromBatch)
+		}
+		if fb.TransferredBy != req {
+			return fmt.Errorf("%w: 续接请求号 %q 与原批次 %q 的转交标记不一致", ErrCorrupt, req, r.FromBatch)
+		}
+		if r.Station != fb.Station || r.FromCourier != fb.Courier {
+			return fmt.Errorf("%w: 续接请求号 %q 的站点或原配送员与原批次 %q 不一致", ErrCorrupt, req, r.FromBatch)
+		}
+		tb, ok := l.Batches[r.ToBatch]
+		if !ok {
+			return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的新批次 %q", ErrCorrupt, req, r.ToBatch)
+		}
+		if tb.FromReassign != req {
+			return fmt.Errorf("%w: 续接请求号 %q 与新批次 %q 的来源标记不一致", ErrCorrupt, req, r.ToBatch)
+		}
+		if tb.Station != r.Station || tb.Courier != r.ToCourier || !tb.Time.Equal(r.Time) {
+			return fmt.Errorf("%w: 续接请求号 %q 与新批次 %q 的记录不一致", ErrCorrupt, req, r.ToBatch)
+		}
+		if len(tb.Parcels) != len(r.Parcels) {
+			return fmt.Errorf("%w: 续接请求号 %q 的转交集合与新批次 %q 的成员不一致", ErrCorrupt, req, r.ToBatch)
+		}
+		for i := range tb.Parcels {
+			if tb.Parcels[i] != r.Parcels[i] {
+				return fmt.Errorf("%w: 续接请求号 %q 的转交集合与新批次 %q 的成员不一致", ErrCorrupt, req, r.ToBatch)
+			}
+		}
+		expect := make([]string, 0, len(fb.Parcels))
+		for _, pid := range fb.Parcels {
+			if _, done := fb.Receipts[pid]; !done {
+				expect = append(expect, pid)
+			}
+		}
+		if len(expect) != len(r.Parcels) {
+			return fmt.Errorf("%w: 续接请求号 %q 的转交集合与原批次 %q 的未回执成员不一致", ErrCorrupt, req, r.FromBatch)
+		}
+		for i := range expect {
+			if expect[i] != r.Parcels[i] {
+				return fmt.Errorf("%w: 续接请求号 %q 的转交集合与原批次 %q 的未回执成员不一致", ErrCorrupt, req, r.FromBatch)
+			}
+		}
+		for _, pid := range r.Parcels {
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的包裹 %q", ErrCorrupt, req, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "续接" && e.Request == req {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 续接请求号 %q 的转交包裹 %q 缺少对应的续接轨迹", ErrCorrupt, req, pid)
 			}
 		}
 	}
@@ -754,6 +891,9 @@ func (s *Store) Return(request, handoffReq, reason string, now time.Time) (resul
 // 批次号相同但内容不同报冲突；失败的首次出站不占用批次号。
 func (s *Store) Dispatch(batch, station, courier string, parcels []string, now time.Time) (result *BatchResult, replayed bool, err error) {
 	if saved, ok := s.data.Batches[batch]; ok {
+		if saved.FromReassign != "" {
+			return nil, false, fmt.Errorf("批次号 %q 已由续接 %q 创建，不能用于出站，内容冲突", batch, saved.FromReassign)
+		}
 		if saved.Station == station && saved.Courier == courier && sameSet(saved.Parcels, parcels) {
 			return saved, true, nil
 		}
@@ -1116,7 +1256,7 @@ func (s *Store) Unfreeze(request, incident, note string, now time.Time) (res *Un
 // Abort 中止一个配送批次：配送员已将该批次全部尚未回执的包裹实物收回出发站。
 // 成员与站点取自原批次结果，不允许另选成员或站点。
 //
-// 首次中止：批次必须存在、尚未完成且未中止，且至少有一件未回执成员；这些成员
+// 首次中止：批次必须存在、尚未完成且未中止、未整批续接转交，且至少有一件未回执成员；这些成员
 // 必须仍在原批次配送中、归属出发站，任一不符整批拒绝、不作任何改动。已回执成员
 // 及其回执完全保留，即使它们已进入其他批次或被冻结也不阻止中止，不检查也不改变
 // 其当前状态。全部满足时按原成员顺序将全部未回执件恢复“在站”（站点为出发站），
@@ -1144,6 +1284,9 @@ func (s *Store) Abort(request, batch, reason string, now time.Time) (res *AbortR
 	}
 	if b.AbortedBy != "" {
 		return nil, false, fmt.Errorf("中止失败：批次 %q 已中止（中止请求号 %q），每批只能成功中止一次", batch, b.AbortedBy)
+	}
+	if b.TransferredBy != "" {
+		return nil, false, fmt.Errorf("中止失败：批次 %q 已整批续接转交（续接请求号 %q），不能中止", batch, b.TransferredBy)
 	}
 	if b.Done() {
 		return nil, false, fmt.Errorf("中止失败：批次 %q 已全部回执完成，不能中止", batch)
@@ -1224,10 +1367,147 @@ func (s *Store) BatchAbort(batch string) *AbortResult {
 	return s.data.Aborts[b.AbortedBy]
 }
 
-// currentBatch 返回包裹当前配送中的批次号（最后一条出站记录的批次）；不在配送中返回空。
+// Reassign 提交一次配送途中整批续接：原配送员把原批次全部尚未回执的包裹在途中
+// 交给另一配送员，新建批次继续配送，无需回站。成员与站点取自原批次，不允许另选。
+//
+// 首次续接：原批次必须存在、仍开放（未中止、未转交、未全部回执完成）且至少有一件
+// 未回执成员；新批次号从未被出站或续接使用；新配送员必须与原配送员不同。未回执件
+// 必须全部仍在原批次配送中且归属出发站，任一不符整次拒绝、不作任何改动。已回执成员
+// 不检查也不变更，其后续流转或冻结不阻止续接。成功时新批次按原成员顺序接纳全部
+// 未回执件，沿用出发站，记录新配送员及接手时间；包裹保持“配送中”及原站点，当前
+// 配送归属切换到新批次，各追加一条含请求号、前后批次、新配送员、站点、原因和时间的
+// 续接记录。原批次永久关闭为已转交，保留原成员、配送员、出站时间和真实回执；
+// 转交不算回执、收回或再次出站。转交件不能首次回执旧批次（receipt 与
+// receipt-import 同样遵守）；旧批次不能首次中止或再次续接；新批次可回执、导入、
+// 中止或再次续接。续接算新的流转，续接后不能退回配送前的旧交接。
+// 续接请求号独立去重，可与批次号、包裹号及其他业务编号同名：相同请求号且原批次、
+// 新批次、新配送员、清理后的原因相同，直接返回首次转交集合、续接信息及时间，
+// replayed 为 true，不检查现状、不重算成员、不改写台账；请求号相同但内容不同报冲突；
+// 失败的首次续接不占用请求号。
+func (s *Store) Reassign(request, fromBatch, toBatch, courier, reason string, now time.Time) (res *ReassignResult, replayed bool, err error) {
+	if saved, ok := s.data.Reassigns[request]; ok {
+		if saved.FromBatch == fromBatch && saved.ToBatch == toBatch && saved.ToCourier == courier && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("续接请求号 %q 已用于一次不同的续接（原批次=%q 新批次=%q 新配送员=%q），内容冲突",
+			request, saved.FromBatch, saved.ToBatch, saved.ToCourier)
+	}
+
+	b, ok := s.data.Batches[fromBatch]
+	if !ok {
+		return nil, false, fmt.Errorf("续接失败：原批次号 %q 不存在", fromBatch)
+	}
+	if b.TransferredBy != "" {
+		return nil, false, fmt.Errorf("续接失败：原批次 %q 已整批续接转交（续接请求号 %q），不能再次续接", fromBatch, b.TransferredBy)
+	}
+	if b.AbortedBy != "" {
+		return nil, false, fmt.Errorf("续接失败：原批次 %q 已中止（中止请求号 %q），不能续接", fromBatch, b.AbortedBy)
+	}
+	if b.Done() {
+		return nil, false, fmt.Errorf("续接失败：原批次 %q 已全部回执完成，不能续接", fromBatch)
+	}
+	if _, used := s.data.Batches[toBatch]; used {
+		return nil, false, fmt.Errorf("续接失败：新批次号 %q 已被出站或续接使用，不能复用", toBatch)
+	}
+	if courier == b.Courier {
+		return nil, false, fmt.Errorf("续接失败：新配送员 %q 与原批次 %q 的配送员相同，续接必须更换配送员", courier, fromBatch)
+	}
+
+	// 按原成员顺序挑出全部未回执成员（批次未完成，必至少有一件）。
+	transferred := make([]string, 0, len(b.Parcels)-len(b.Receipts))
+	for _, pid := range b.Parcels {
+		if _, done := b.Receipts[pid]; !done {
+			transferred = append(transferred, pid)
+		}
+	}
+	if len(transferred) == 0 {
+		return nil, false, fmt.Errorf("续接失败：原批次 %q 没有未回执成员，不能续接", fromBatch)
+	}
+
+	// 先做全部校验：未回执成员必须仍在原批次配送中且归属出发站，任一不符整次拒绝。
+	for _, pid := range transferred {
+		p := s.data.Parcels[pid] // 批次成员必已登记（载入校验保证）
+		if p.Status != statusDelivering || currentBatch(p) != fromBatch || p.Station != b.Station {
+			return nil, false, fmt.Errorf("续接失败：包裹 %q 当前归属 %q、状态 %q，不在批次 %q 从出发站 %q 配送中，整批续接未执行",
+				pid, p.Station, p.Status, fromBatch, b.Station)
+		}
+	}
+
+	res = &ReassignResult{
+		Request:     request,
+		FromBatch:   fromBatch,
+		ToBatch:     toBatch,
+		Station:     b.Station,
+		FromCourier: b.Courier,
+		ToCourier:   courier,
+		Reason:      reason,
+		Parcels:     transferred,
+		Time:        now,
+	}
+	nb := &BatchResult{
+		Batch:        toBatch,
+		Station:      b.Station,
+		Courier:      courier,
+		Parcels:      append([]string(nil), transferred...),
+		Time:         now, // 接手时间
+		Receipts:     map[string]*ReceiptEntry{},
+		FromReassign: request,
+	}
+	s.data.Reassigns[request] = res
+	s.data.Batches[toBatch] = nb
+	b.TransferredBy = request
+
+	// 记录旧值，落盘失败时整体回滚。包裹保持“配送中”及原站点，仅追加续接轨迹。
+	prev := make(map[string][]Event, len(transferred))
+	for _, pid := range transferred {
+		p := s.data.Parcels[pid]
+		prev[pid] = append([]Event(nil), p.Trail...)
+		p.Trail = append(p.Trail, Event{
+			Op:        "续接",
+			Station:   b.Station,
+			Batch:     toBatch,
+			FromBatch: fromBatch,
+			Courier:   courier,
+			Request:   request,
+			Reason:    reason,
+			Time:      now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Reassigns, request)
+		delete(s.data.Batches, toBatch)
+		b.TransferredBy = ""
+		for pid, old := range prev {
+			s.data.Parcels[pid].Trail = old
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// BatchTransfer 返回一个批次作为原批次的转交去向（续接结果）；批次不存在或未转交时返回 nil。
+func (s *Store) BatchTransfer(batch string) *ReassignResult {
+	b, ok := s.data.Batches[batch]
+	if !ok || b.TransferredBy == "" {
+		return nil
+	}
+	return s.data.Reassigns[b.TransferredBy]
+}
+
+// BatchOrigin 返回一个批次作为新批次的续接来源（续接结果）；批次不存在或非续接创建时返回 nil。
+func (s *Store) BatchOrigin(batch string) *ReassignResult {
+	b, ok := s.data.Batches[batch]
+	if !ok || b.FromReassign == "" {
+		return nil
+	}
+	return s.data.Reassigns[b.FromReassign]
+}
+
+// currentBatch 返回包裹当前配送中的批次号（最后一条出站或续接记录的批次）；不在配送中返回空。
 func currentBatch(p *Parcel) string {
 	for i := len(p.Trail) - 1; i >= 0; i-- {
-		if p.Trail[i].Op == "出站" {
+		if p.Trail[i].Op == "出站" || p.Trail[i].Op == "续接" {
 			return p.Trail[i].Batch
 		}
 	}
@@ -1248,7 +1528,7 @@ func activeFreeze(p *Parcel) string {
 	return ""
 }
 
-// lastFlowEvent 返回轨迹中最后一条真实流转记录（交接/退回/出站/回执/收回）。
+// lastFlowEvent 返回轨迹中最后一条真实流转记录（交接/退回/出站/回执/收回/续接）。
 // 冻结与解除只是管理记录，不算新流转，判定旧交接可否退回时须跳过它们。
 func lastFlowEvent(trail []Event) Event {
 	for i := len(trail) - 1; i >= 0; i-- {
