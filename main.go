@@ -90,6 +90,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReceiptImport(dataFile, rest[1:], stdout, stderr)
 	case "batch":
 		return cmdBatch(dataFile, rest[1:], stdout, stderr)
+	case "abort":
+		return cmdAbort(dataFile, rest[1:], stdout, stderr)
 	case "freeze":
 		return cmdFreeze(dataFile, rest[1:], stdout, stderr)
 	case "unfreeze":
@@ -128,7 +130,8 @@ func printHelp(w io.Writer) {
   dispatch               配送批次出站：整批包裹转为“配送中”，批次成员保存后不可修改
   receipt                逐件回执：签收或失败（失败须给原因）；全部回执后批次自动完成
   receipt-import         从本地文件整批导入回执：全部可接受才整体生效，任一不符整份拒绝
-  batch                  按批次号查询成员、配送员、出站时间与逐件回执进度
+  batch                  按批次号查询成员、配送员、出站时间、逐件回执进度与中止信息
+  abort                  配送批次中止：将全部未回执包裹实物收回出发站，批次永久关闭
   freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
 
@@ -144,12 +147,13 @@ func printHelp(w io.Writer) {
   %s receipt  --request RC2 --batch B1 --parcel P002 --result 失败 --reason 收件人不在
   %s receipt-import --file receipts.json
   %s batch    --id B1
+  %s abort    --request AB1 --batch B1 --reason 配送员车辆故障
   %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
   %s unfreeze --request U1 --incident E1 --note 已核实放行
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -179,7 +183,8 @@ func printQueryHelp(w io.Writer) {
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
 与请求号；冻结记录显示异常单号、原因、站点和时间；解除冻结记录
-显示异常单号、解除请求号、处理说明和时间。包裹不存在时报错，不会创建记录。
+显示异常单号、解除请求号、处理说明和时间；收回记录显示批次号、
+中止请求号、原因、站点和时间。包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -267,6 +272,7 @@ func printReceiptHelp(w io.Writer) {
   - 请求号、批次号、包裹编号均去除两端空白，不可为空或仅含空白
   - 结果为“失败”时必须给出清理后非空的原因；结果为“签收”时不可带原因
   - 首次回执：包裹必须属于该批次、尚未在该批次回执，且当前仍在该批次配送中
+    （已中止批次的未回执包裹已被收回出发站，不能首次回执该批次）
   - 签收后状态为“已签收”；失败表示实物已回到出发站，恢复“在站”，
     可加入新的配送批次；两种结果都保留站点并追加含批次、结果、原因
     （失败时）、请求号和时间的回执记录
@@ -304,7 +310,8 @@ func printReceiptImportHelp(w io.Writer) {
     同请求号且批次、包裹、结果、清理后的原因相同的记录返回首次结果与时间，
     不检查当前状态、不追加轨迹、不改变批次进度；换内容报冲突
   - 首次回执要求批次存在、包裹属于该批次、尚未在该批次回执，
-    且当前仍在该批次配送中；每件在一个批次只能成功回执一次，
+    且当前仍在该批次配送中（已中止批次的未回执包裹已被收回，
+    含此类迟到回执的导入整份拒绝）；每件在一个批次只能成功回执一次，
     同文件换请求号再次回执同一批次同一包裹也会整份拒绝
   - 整份导入只有全部记录可接受并整体保存后才报告成功，按文件顺序列出
     各条结果、发生时间及新增或重放标记；任一记录无效、冲突或受理条件
@@ -323,10 +330,41 @@ func printBatchHelp(w io.Writer) {
   %s batch [--data FILE] --id 批次号
 
 展示批次原成员（按首次提交顺序）、配送员、出发站、出站时间、
-逐件回执与未回执项，以及批次是否完成。批次不存在时报错。
+逐件回执与批次状态：配送中、已完成（全部成员已回执）或已中止。
+已中止的批次同时展示中止请求号、原因与时间；被收回的成员标注
+“已收回”及其中止请求号和时间，不再列为未回执；已回执成员的真实
+回执原样保留。批次不存在时报错。
 
 示例:
   %s batch --id B1
+`, appName, appName, appName)
+}
+
+func printAbortHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s abort — 配送批次中止（未回执包裹实物收回出发站）
+
+用法:
+  %s abort [--data FILE] --request 中止请求号 --batch 批次号 --reason 中止原因
+
+规则:
+  - 中止请求号、批次号、中止原因均去除两端空白，不可为空或仅含空白
+  - 成员与站点取自原批次结果，不允许另选包裹或站点
+  - 首次中止：批次必须存在、尚未完成且未中止，且至少有一件未回执成员；
+    全部未回执成员必须仍在原批次配送中且归属出发站，任一不符整批拒绝
+  - 已回执成员及其回执完全保留，即使它们已进入其他批次或被冻结也不
+    阻止中止，不检查也不改变其当前状态
+  - 成功时按原成员顺序将全部未回执件恢复“在站”（站点仍为出发站），
+    各追加一条含批次、中止请求号、原因、站点和时间的收回记录；
+    批次永久关闭，原成员顺序、配送员和出站时间保留；收回不是回执
+  - 收回件之后可交接、冻结或再次出站，但不能首次回执旧批次；
+    收回算新流转，不能因此退回出站前的旧交接
+  - 中止请求号独立去重，可与批次号、包裹号及其他业务编号同名：
+    相同请求号且批次、清理后的原因相同，直接返回首次收回集合与时间，
+    不重新计算成员、不检查当前状态、不改写台账；换内容报冲突；
+    每批只能成功中止一次，失败的首次中止不占用请求号
+
+示例:
+  %s abort --request AB1 --batch B1 --reason 配送员车辆故障
 `, appName, appName, appName)
 }
 

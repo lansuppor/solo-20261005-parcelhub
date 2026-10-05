@@ -31,14 +31,14 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结
-	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点）
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回
+	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回时为批次出发站）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回/回执请求号（收件、出站记录为空）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/中止请求号（收件、出站记录为空）
 	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）
-	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）或冻结原因（仅冻结记录有）
+	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）或中止原因（仅收回记录有）
 	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）
-	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执记录有）
+	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回记录有）
 	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站记录有）
 	Result     string    `json:"result,omitempty"`     // 回执结果：签收 | 失败（仅回执记录有）
 	// Incident 为冻结/解除冻结记录的异常单号；解除冻结时另外用 Request 存解除请求号、Note 存处理说明。
@@ -93,6 +93,9 @@ type BatchResult struct {
 	Parcels  []string                 `json:"parcels"`  // 批次成员，按首次提交顺序
 	Time     time.Time                `json:"time"`     // 出站时间
 	Receipts map[string]*ReceiptEntry `json:"receipts"` // 逐件回执，按包裹编号索引（未回执的包裹不在其中）
+	// AbortedBy 为中止该批次的中止请求号（未中止为空）；中止永久关闭批次，
+	// 原成员顺序、配送员和出站时间保留不变。
+	AbortedBy string `json:"abortedBy,omitempty"`
 }
 
 // Done 报告批次是否已完成（全部成员均已回执）。
@@ -130,6 +133,17 @@ type UnfreezeResult struct {
 	Time     time.Time `json:"time"`     // 解除时间
 }
 
+// AbortResult 记录一次成功的配送批次中止，用于中止请求号去重与结果重放。
+// 中止请求号独立去重，可与批次号、包裹号及其他业务编号同名；失败的首次中止不占用请求号。
+type AbortResult struct {
+	Request string    `json:"request"` // 中止请求号
+	Batch   string    `json:"batch"`   // 被中止的配送批次号
+	Station string    `json:"station"` // 批次出发站（收回目的站）
+	Reason  string    `json:"reason"`  // 清理后的中止原因
+	Parcels []string  `json:"parcels"` // 首次收回的未回执成员，按原批次成员顺序
+	Time    time.Time `json:"time"`    // 中止时间
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
 	Version   int                        `json:"version"`
@@ -140,6 +154,7 @@ type ledgerFile struct {
 	Receipts  map[string]*ReceiptResult  `json:"receipts"`
 	Freezes   map[string]*FreezeResult   `json:"freezes"`   // 以异常单号为键（含已解除的异常单，永久保留）
 	Unfreezes map[string]*UnfreezeResult `json:"unfreezes"` // 以解除请求号为键
+	Aborts    map[string]*AbortResult    `json:"aborts"`    // 以中止请求号为键
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -164,7 +179,7 @@ func Open(path string) (*Store, error) {
 		if os.IsNotExist(err) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
 				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{},
-				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}}
+				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -178,7 +193,7 @@ func Open(path string) (*Store, error) {
 	if s.data.Version != 1 || s.data.Parcels == nil || s.data.Handoffs == nil {
 		return nil, fmt.Errorf("%w: 缺少必要字段或版本不受支持", ErrCorrupt)
 	}
-	// 早期版本的数据文件没有 returns/batches/receipts/freeze 相关字段：按空表处理，无需手工修改。
+	// 早期版本的数据文件没有 returns/batches/receipts/freeze/abort 相关字段：按空表处理，无需手工修改。
 	if s.data.Returns == nil {
 		s.data.Returns = map[string]*ReturnResult{}
 	}
@@ -193,6 +208,9 @@ func Open(path string) (*Store, error) {
 	}
 	if s.data.Unfreezes == nil {
 		s.data.Unfreezes = map[string]*UnfreezeResult{}
+	}
+	if s.data.Aborts == nil {
+		s.data.Aborts = map[string]*AbortResult{}
 	}
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
@@ -245,6 +263,28 @@ func (l *ledgerFile) validate() error {
 				}
 				if _, ok := l.Batches[e.Batch]; !ok {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条回执轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
+				}
+			}
+			if e.Op == "收回" {
+				if e.Batch == "" || e.Request == "" || e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹缺少批次号、中止请求号或原因", ErrCorrupt, id, i+1)
+				}
+				a, ok := l.Aborts[e.Request]
+				if !ok {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹引用了不存在的中止请求 %q", ErrCorrupt, id, i+1, e.Request)
+				}
+				if a.Batch != e.Batch || a.Station != e.Station || a.Reason != e.Reason || !a.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹与中止请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				member := false
+				for _, pid := range a.Parcels {
+					if pid == id {
+						member = true
+						break
+					}
+				}
+				if !member {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹不在中止请求 %q 的收回集合中", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
 			if e.Op == "冻结" {
@@ -336,6 +376,12 @@ func (l *ledgerFile) validate() error {
 				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执请求号 %q 无法对应", ErrCorrupt, id, pid, e.Request)
 			}
 		}
+		if b.AbortedBy != "" {
+			a, ok := l.Aborts[b.AbortedBy]
+			if !ok || a.Batch != id {
+				return fmt.Errorf("%w: 批次 %q 标记的中止请求号 %q 无法对应", ErrCorrupt, id, b.AbortedBy)
+			}
+		}
 	}
 	for req, rc := range l.Receipts {
 		if rc == nil || req != rc.Request || rc.Batch == "" || rc.Parcel == "" || rc.Time.IsZero() ||
@@ -350,6 +396,50 @@ func (l *ledgerFile) validate() error {
 		e, ok := b.Receipts[rc.Parcel]
 		if !ok || e.Request != req || e.Result != rc.Result || e.Reason != rc.Reason || !e.Time.Equal(rc.Time) {
 			return fmt.Errorf("%w: 回执请求号 %q 与批次 %q 的回执记录不一致", ErrCorrupt, req, rc.Batch)
+		}
+	}
+	// 中止：收回集合必须恰好是批次中未回执的成员（按原成员顺序），
+	// 且每件收回包裹的轨迹中都有与该中止记录一致的收回记录。
+	for req, a := range l.Aborts {
+		if a == nil || req != a.Request || a.Batch == "" || a.Station == "" || a.Reason == "" ||
+			len(a.Parcels) == 0 || a.Time.IsZero() {
+			return fmt.Errorf("%w: 中止请求号 %q 的中止结果不完整", ErrCorrupt, req)
+		}
+		b, ok := l.Batches[a.Batch]
+		if !ok {
+			return fmt.Errorf("%w: 中止请求号 %q 引用了不存在的批次 %q", ErrCorrupt, req, a.Batch)
+		}
+		if b.AbortedBy != req {
+			return fmt.Errorf("%w: 中止请求号 %q 与批次 %q 的中止标记不一致", ErrCorrupt, req, a.Batch)
+		}
+		if a.Station != b.Station {
+			return fmt.Errorf("%w: 中止请求号 %q 记录的站点 %q 与批次 %q 出发站 %q 不一致",
+				ErrCorrupt, req, a.Station, a.Batch, b.Station)
+		}
+		pending := make([]string, 0, len(b.Parcels))
+		for _, pid := range b.Parcels {
+			if _, done := b.Receipts[pid]; !done {
+				pending = append(pending, pid)
+			}
+		}
+		if !sameList(a.Parcels, pending) {
+			return fmt.Errorf("%w: 中止请求号 %q 的收回集合与批次 %q 的未回执成员不一致", ErrCorrupt, req, a.Batch)
+		}
+		for _, pid := range a.Parcels {
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 中止请求号 %q 引用了不存在的包裹 %q", ErrCorrupt, req, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "收回" && e.Request == req {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 中止请求号 %q 的收回包裹 %q 缺少对应的收回轨迹", ErrCorrupt, req, pid)
+			}
 		}
 	}
 	// 冻结/解除冻结：先遍历轨迹核对冻结与解除必须成对出现、顺序正确，
@@ -1018,6 +1108,109 @@ func (s *Store) Unfreeze(request, incident, note string, now time.Time) (res *Un
 	return res, false, nil
 }
 
+// Abort 中止一个配送批次：配送员已将该批次所有尚未回执的包裹实物收回出发站。
+//
+// 首次中止：批次必须存在、尚未完成（仍有成员未回执）且未中止；全部未回执成员
+// 必须仍在原批次配送中且归属出发站，任一不符整批拒绝、不作任何改动。已回执成员
+// 及其回执完全保留，即使它们已进入其他批次或被冻结也不阻止中止，不检查也不改变
+// 其当前状态。全部满足时按原成员顺序将全部未回执件恢复“在站”（站点仍为出发站），
+// 各追加一条含批次、中止请求号、原因、站点和时间的收回记录，批次永久标记为已中止
+// （原成员顺序、配送员和出站时间保留）；收回不是回执，不伪造成失败回执。
+// 相同中止请求号且批次、清理后的原因相同：直接返回首次结果与首次收回集合，
+// replayed 为 true，不重新计算成员、不检查当前状态、不改写台账；
+// 请求号相同但批次或原因不同报冲突。每批只能成功中止一次：换请求号再中止
+// 或中止正常完成的批次均拒绝；失败的首次中止不占用请求号。
+// 中止请求号与批次号、包裹号及其他业务编号分属独立去重范围，允许同名。
+func (s *Store) Abort(request, batch, reason string, now time.Time) (res *AbortResult, replayed bool, err error) {
+	if saved, ok := s.data.Aborts[request]; ok {
+		if saved.Batch == batch && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("中止请求号 %q 已用于一次不同的中止（批次=%q 原因=%q），内容冲突",
+			request, saved.Batch, saved.Reason)
+	}
+
+	b, ok := s.data.Batches[batch]
+	if !ok {
+		return nil, false, fmt.Errorf("中止失败：批次号 %q 不存在", batch)
+	}
+	if b.AbortedBy != "" {
+		return nil, false, fmt.Errorf("中止失败：批次 %q 已中止（中止请求号 %q），每批只能成功中止一次", batch, b.AbortedBy)
+	}
+	if b.Done() {
+		return nil, false, fmt.Errorf("中止失败：批次 %q 已正常完成，不能中止", batch)
+	}
+
+	// 未回执成员按原批次成员顺序收回；已回执成员不检查、不改变。
+	pending := make([]string, 0, len(b.Parcels))
+	for _, pid := range b.Parcels {
+		if _, done := b.Receipts[pid]; !done {
+			pending = append(pending, pid)
+		}
+	}
+	if len(pending) == 0 {
+		return nil, false, fmt.Errorf("中止失败：批次 %q 没有未回执成员，不能中止", batch)
+	}
+
+	// 先做全部校验，任何一件不满足都整批拒绝。
+	for _, id := range pending {
+		p := s.data.Parcels[id] // 批次成员必已登记（载入校验保证）
+		if p.Status != statusDelivering || currentBatch(p) != batch {
+			return nil, false, fmt.Errorf("中止失败：包裹 %q 当前状态为 %q，不在批次 %q 配送中，整批中止未执行",
+				id, p.Status, batch)
+		}
+		if p.Station != b.Station {
+			return nil, false, fmt.Errorf("中止失败：包裹 %q 当前归属 %q，不归属出发站 %q，整批中止未执行",
+				id, p.Station, b.Station)
+		}
+	}
+
+	res = &AbortResult{
+		Request: request,
+		Batch:   batch,
+		Station: b.Station,
+		Reason:  reason,
+		Parcels: pending,
+		Time:    now,
+	}
+	s.data.Aborts[request] = res
+	b.AbortedBy = request
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string]struct {
+		status string
+		trail  []Event
+	}, len(pending))
+	for _, id := range pending {
+		p := s.data.Parcels[id]
+		prev[id] = struct {
+			status string
+			trail  []Event
+		}{p.Status, append([]Event(nil), p.Trail...)}
+		p.Status = statusInStation // 实物已收回出发站，站点仍记出发站
+		p.Trail = append(p.Trail, Event{
+			Op:      "收回",
+			Station: b.Station,
+			Batch:   batch,
+			Request: request,
+			Reason:  reason,
+			Time:    now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Aborts, request)
+		b.AbortedBy = ""
+		for id, old := range prev {
+			p := s.data.Parcels[id]
+			p.Status = old.status
+			p.Trail = old.trail
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
 // currentBatch 返回包裹当前配送中的批次号（最后一条出站记录的批次）；不在配送中返回空。
 func currentBatch(p *Parcel) string {
 	for i := len(p.Trail) - 1; i >= 0; i-- {
@@ -1063,6 +1256,24 @@ func (s *Store) BatchQuery(batch string) (*BatchResult, error) {
 		return nil, fmt.Errorf("批次 %q 不存在", batch)
 	}
 	return b, nil
+}
+
+// AbortQuery 返回一个中止请求号对应的中止结果；不存在时返回 nil。
+func (s *Store) AbortQuery(request string) *AbortResult {
+	return s.data.Aborts[request]
+}
+
+// sameList 判断两个字符串列表是否逐项相同（顺序影响判定）。
+func sameList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sameSet 判断两个包裹列表作为集合是否相同（顺序不影响判定）。
