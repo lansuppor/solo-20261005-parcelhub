@@ -264,3 +264,168 @@ func TestCLIReturnValidation(t *testing.T) {
 		t.Fatalf("清洗后同内容应重放: code=%d out=%s", code, out)
 	}
 }
+
+func TestCLIEndToEndDispatchReceiptBatch(t *testing.T) {
+	dbPath := t.TempDir() + "/ledger.json"
+
+	runCLI(t, dbPath, "register", "--id", "P001", "--station", "站点A")
+	runCLI(t, dbPath, "register", "--id", "P002", "--station", "站点A")
+
+	// 出站：整批转为配送中，站点仍记出发站。
+	out, _, code := runCLI(t, dbPath, "dispatch",
+		"--batch", "B1", "--station", "站点A", "--courier", "张三",
+		"--parcel", "P001", "--parcel", "P002")
+	if code != 0 || !strings.Contains(out, "出站成功") ||
+		!strings.Contains(out, "批次号: B1") || !strings.Contains(out, "配送员: 张三") ||
+		!strings.Contains(out, "- P001") || !strings.Contains(out, "- P002") {
+		t.Fatalf("出站输出不符: code=%d out=%s", code, out)
+	}
+
+	// query 展示新状态与出站轨迹。
+	out, _, code = runCLI(t, dbPath, "query", "--id", "P001")
+	if code != 0 || !strings.Contains(out, "当前站点: 站点A") || !strings.Contains(out, "当前状态: 配送中") ||
+		!strings.Contains(out, "2. 操作: 出站") || !strings.Contains(out, "批次号: B1") || !strings.Contains(out, "配送员: 张三") {
+		t.Fatalf("出站后查询不符: code=%d out=%s", code, out)
+	}
+
+	// 同批次号同内容换序：重放首次结果，不追加轨迹。
+	out, _, code = runCLI(t, dbPath, "dispatch",
+		"--batch", "B1", "--station", "站点A", "--courier", "张三",
+		"--parcel", "P002", "--parcel", "P001")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("重复出站应重放: code=%d out=%s", code, out)
+	}
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P001")
+	if strings.Count(out, "操作: 出站") != 1 {
+		t.Fatalf("重放不得追加出站轨迹:\n%s", out)
+	}
+
+	// 同批次号换内容：冲突。
+	_, errText, code := runCLI(t, dbPath, "dispatch",
+		"--batch", "B1", "--station", "站点A", "--courier", "李四", "--parcel", "P001")
+	if code != exitBusiness || !strings.Contains(errText, "冲突") {
+		t.Fatalf("批次号内容冲突应失败: code=%d err=%s", code, errText)
+	}
+
+	// 逐件回执：P001 签收，P002 失败。
+	out, _, code = runCLI(t, dbPath, "receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "签收")
+	if code != 0 || !strings.Contains(out, "回执成功") || !strings.Contains(out, "结果: 签收") {
+		t.Fatalf("签收回执输出不符: code=%d out=%s", code, out)
+	}
+	out, _, code = runCLI(t, dbPath, "receipt", "--request", "RC2", "--batch", "B1", "--parcel", "P002",
+		"--result", "失败", "--reason", "收件人不在")
+	if code != 0 || !strings.Contains(out, "结果: 失败") || !strings.Contains(out, "原因: 收件人不在") {
+		t.Fatalf("失败回执输出不符: code=%d out=%s", code, out)
+	}
+
+	// query 展示回执轨迹与新状态。
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P001")
+	if !strings.Contains(out, "当前状态: 已签收") || !strings.Contains(out, "3. 操作: 回执") ||
+		!strings.Contains(out, "结果: 签收") || !strings.Contains(out, "请求号: RC1") {
+		t.Fatalf("签收后查询不符:\n%s", out)
+	}
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P002")
+	if !strings.Contains(out, "当前状态: 在站") || !strings.Contains(out, "结果: 失败") ||
+		!strings.Contains(out, "原因: 收件人不在") {
+		t.Fatalf("失败回执后查询不符:\n%s", out)
+	}
+
+	// 批次查询：全部回执后已完成。
+	out, _, code = runCLI(t, dbPath, "batch", "--id", "B1")
+	if code != 0 || !strings.Contains(out, "批次号: B1") || !strings.Contains(out, "配送员: 张三") ||
+		!strings.Contains(out, "出发站: 站点A") || !strings.Contains(out, "批次状态: 已完成") ||
+		!strings.Contains(out, "逐件回执（2/2 已回执）") ||
+		!strings.Contains(out, "- P001") || !strings.Contains(out, "结果: 签收") ||
+		!strings.Contains(out, "- P002") || !strings.Contains(out, "原因: 收件人不在") {
+		t.Fatalf("批次查询输出不符: code=%d out=%s", code, out)
+	}
+
+	// 不存在的批次：报错、退出 1。
+	_, errText, code = runCLI(t, dbPath, "batch", "--id", "NOPE")
+	if code != exitBusiness || !strings.Contains(errText, "不存在") {
+		t.Fatalf("查询不存在批次应报错(1): code=%d err=%s", code, errText)
+	}
+
+	// 回执重放：同请求号同内容返回首次结果，不追加轨迹。
+	out, _, code = runCLI(t, dbPath, "receipt", "--request", "RC2", "--batch", "B1", "--parcel", "P002",
+		"--result", "失败", "--reason", "收件人不在")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("重复回执应重放: code=%d out=%s", code, out)
+	}
+	out, _, _ = runCLI(t, dbPath, "query", "--id", "P002")
+	if strings.Count(out, "操作: 回执") != 1 {
+		t.Fatalf("重放不得追加回执轨迹:\n%s", out)
+	}
+
+	// 同回执请求号换内容：冲突。
+	_, errText, code = runCLI(t, dbPath, "receipt", "--request", "RC2", "--batch", "B1", "--parcel", "P002", "--result", "签收")
+	if code != exitBusiness || !strings.Contains(errText, "冲突") {
+		t.Fatalf("回执请求号内容冲突应失败: code=%d err=%s", code, errText)
+	}
+
+	// 失败包裹恢复在站，可加入新批次；新批次查询显示未回执项。
+	out, _, code = runCLI(t, dbPath, "dispatch",
+		"--batch", "B2", "--station", "站点A", "--courier", "李四", "--parcel", "P002")
+	if code != 0 {
+		t.Fatalf("失败包裹重新出站应成功: code=%d", code)
+	}
+	out, _, code = runCLI(t, dbPath, "batch", "--id", "B2")
+	if code != 0 || !strings.Contains(out, "批次状态: 配送中") || !strings.Contains(out, "- P002    未回执") {
+		t.Fatalf("新批次查询不符: code=%d out=%s", code, out)
+	}
+}
+
+func TestCLIDispatchReceiptValidation(t *testing.T) {
+	dbPath := t.TempDir() + "/ledger.json"
+	runCLI(t, dbPath, "register", "--id", "P001", "--station", "站点A")
+	runCLI(t, dbPath, "dispatch", "--batch", "B1", "--station", "站点A", "--courier", "张三", "--parcel", "P001")
+
+	cases := []struct {
+		args   []string
+		errSub string
+	}{
+		{[]string{"dispatch", "--batch", "  ", "--station", "A", "--courier", "张三", "--parcel", "P1"}, "不可为空"},
+		{[]string{"dispatch", "--batch", "B2", "--station", "A", "--courier", " \t", "--parcel", "P1"}, "不可为空"},
+		{[]string{"dispatch", "--batch", "B2", "--station", "A", "--courier", "张三"}, "不可为空"},
+		{[]string{"dispatch", "--batch", "B2", "--station", "A", "--courier", "张三",
+			"--parcel", "P1", "--parcel", "P1"}, "重复"},
+		{[]string{"receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "丢了"}, "签收"},
+		{[]string{"receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "失败"}, "原因不可为空"},
+		{[]string{"receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "失败", "--reason", "  "}, "原因不可为空"},
+		{[]string{"receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "签收", "--reason", "x"}, "不可带原因"},
+		{[]string{"receipt", "--request", "  ", "--batch", "B1", "--parcel", "P001", "--result", "签收"}, "不可为空"},
+		{[]string{"batch", "--id", " "}, "不可为空"},
+	}
+	for _, c := range cases {
+		var out, errb bytes.Buffer
+		full := append([]string{"--data", dbPath}, c.args...)
+		code := run(full, &out, &errb)
+		if code != exitBusiness || !strings.Contains(errb.String(), c.errSub) {
+			t.Fatalf("%v 应失败(1)且提示 %q，得到 code=%d err=%q", c.args, c.errSub, code, errb.String())
+		}
+	}
+
+	// 空白清洗后等价的提交视为同一请求（此处首次成功，再次提交为重放）。
+	out, _, code := runCLI(t, dbPath, "receipt", "--request", " RC1 ", "--batch", " B1 ", "--parcel", " P001 ", "--result", " 签收 ")
+	if code != 0 || !strings.Contains(out, "回执成功") {
+		t.Fatalf("两端空白应被清洗后成功: code=%d out=%s", code, out)
+	}
+	out, _, code = runCLI(t, dbPath, "receipt", "--request", "RC1", "--batch", "B1", "--parcel", "P001", "--result", "签收")
+	if code != 0 || !strings.Contains(out, "返回首次保存的结果") {
+		t.Fatalf("清洗后同内容应重放: code=%d out=%s", code, out)
+	}
+}
+
+func TestCLIDispatchHelpVariants(t *testing.T) {
+	for _, args := range [][]string{
+		{"dispatch", "--help"},
+		{"receipt", "-h"},
+		{"batch", "--help"},
+	} {
+		var out, errb bytes.Buffer
+		code := run(args, &out, &errb)
+		if code != 0 || !strings.Contains(out.String(), appName) || errb.Len() != 0 {
+			t.Fatalf("%v 帮助应以 0 退出且不含 stderr: code=%d", args, code)
+		}
+	}
+}

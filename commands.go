@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // timeFmt 是命令行展示时间的格式（JSON 文件内使用 RFC3339）。
@@ -104,17 +105,29 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "包裹编号: %s\n当前站点: %s\n当前状态: %s\n轨迹（按提交顺序，共 %d 条）:\n",
 		p.ID, p.Station, p.Status, len(p.Trail))
 	for i, e := range p.Trail {
-		if e.Op == "退回" {
+		switch e.Op {
+		case "退回":
 			fmt.Fprintf(stdout, "  %d. 操作: 退回    源站: %s    目的站: %s    退回请求号: %s    原交接请求号: %s    原因: %s    时间: %s\n",
 				i+1, e.From, e.Station, e.Request, e.RefRequest, e.Reason, e.Time.Format(timeFmt))
-			continue
+		case "出站":
+			fmt.Fprintf(stdout, "  %d. 操作: 出站    站点: %s    批次号: %s    配送员: %s    时间: %s\n",
+				i+1, e.Station, e.Batch, e.Courier, e.Time.Format(timeFmt))
+		case "回执":
+			if e.Result == resultFailed {
+				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    原因: %s    请求号: %s    时间: %s\n",
+					i+1, e.Station, e.Batch, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt))
+			} else {
+				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    请求号: %s    时间: %s\n",
+					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt))
+			}
+		default:
+			req := e.Request
+			if req == "" {
+				req = "-"
+			}
+			fmt.Fprintf(stdout, "  %d. 操作: %s    站点: %s    请求号: %s    时间: %s\n",
+				i+1, e.Op, e.Station, req, e.Time.Format(timeFmt))
 		}
-		req := e.Request
-		if req == "" {
-			req = "-"
-		}
-		fmt.Fprintf(stdout, "  %d. 操作: %s    站点: %s    请求号: %s    时间: %s\n",
-			i+1, e.Op, e.Station, req, e.Time.Format(timeFmt))
 	}
 	return exitOK
 }
@@ -241,5 +254,202 @@ func cmdReturn(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", result.Time.Format(timeFmt))
+	return exitOK
+}
+
+// cleanParcelList 清洗并校验可重复的 --parcel 参数：逐个去除两端空白、
+// 不可为空、集合不可为空且编号不可重复。
+func cleanParcelList(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("包裹集合不可为空，至少需要一个 --parcel")
+	}
+	clean := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, v := range raw {
+		id, err := cleanID("包裹编号", v)
+		if err != nil {
+			return nil, err
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("包裹集合中编号 %q 重复", id)
+		}
+		seen[id] = true
+		clean = append(clean, id)
+	}
+	return clean, nil
+}
+
+func cmdDispatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("dispatch", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	batch := fs.String("batch", "", "配送批次号（用于去重，完成后也不能复用）")
+	station := fs.String("station", "", "出发站")
+	courier := fs.String("courier", "", "配送员")
+	var parcels stringList
+	fs.Var(&parcels, "parcel", "包裹编号，可重复指定；集合不可为空或含重复编号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printDispatchHelp); !ok {
+		return code
+	}
+
+	cleanBatch, err := cleanID("批次号", *batch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanStation, err := cleanID("出发站", *station)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanCourier, err := cleanID("配送员", *courier)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanParcels, err := cleanParcelList(parcels)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+	result, replayed, err := store.Dispatch(cleanBatch, cleanStation, cleanCourier, cleanParcels, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "出站成功"
+	if replayed {
+		headline = "出站成功（批次号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n批次号: %s\n出发站: %s\n配送员: %s\n包裹（%d 件）:\n",
+		headline, result.Batch, result.Station, result.Courier, len(result.Parcels))
+	for _, id := range result.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", result.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("receipt", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "回执请求号（用于去重）")
+	batch := fs.String("batch", "", "配送批次号")
+	parcel := fs.String("parcel", "", "包裹编号")
+	result := fs.String("result", "", "回执结果：签收 或 失败")
+	reason := fs.String("reason", "", "失败原因（结果为失败时必填，签收时不可带）")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiptHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("回执请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanBatch, err := cleanID("批次号", *batch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanParcel, err := cleanID("包裹编号", *parcel)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanResult, err := cleanID("回执结果", *result)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+	if cleanResult != resultSigned && cleanResult != resultFailed {
+		fmt.Fprintf(stderr, "%s receipt: 回执结果只能是 %q 或 %q，得到 %q\n", appName, resultSigned, resultFailed, cleanResult)
+		return exitBusiness
+	}
+	cleanReason := strings.TrimSpace(*reason)
+	if cleanResult == resultFailed && cleanReason == "" {
+		fmt.Fprintf(stderr, "%s receipt: 结果为失败时原因不可为空或仅含空白\n", appName)
+		return exitBusiness
+	}
+	if cleanResult == resultSigned && cleanReason != "" {
+		fmt.Fprintf(stderr, "%s receipt: 结果为签收时不可带原因\n", appName)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+	res, replayed, err := store.Receipt(cleanReq, cleanBatch, cleanParcel, cleanResult, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "回执成功"
+	if replayed {
+		headline = "回执成功（请求号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n请求号: %s\n批次号: %s\n包裹编号: %s\n结果: %s\n",
+		headline, res.Request, res.Batch, res.Parcel, res.Result)
+	if res.Result == resultFailed {
+		fmt.Fprintf(stdout, "原因: %s\n", res.Reason)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("batch", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	id := fs.String("id", "", "要查询的配送批次号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printBatchHelp); !ok {
+		return code
+	}
+
+	cleanIDVal, err := cleanID("批次号", *id)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s batch: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s batch: %v\n", appName, err)
+		return exitBusiness
+	}
+	b, err := store.BatchQuery(cleanIDVal)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s batch: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	status := "配送中"
+	if b.Done() {
+		status = "已完成"
+	}
+	fmt.Fprintf(stdout, "批次号: %s\n出发站: %s\n配送员: %s\n出站时间: %s\n批次状态: %s\n逐件回执（%d/%d 已回执）:\n",
+		b.Batch, b.Station, b.Courier, b.Time.Format(timeFmt), status, len(b.Receipts), len(b.Parcels))
+	for _, pid := range b.Parcels {
+		e, ok := b.Receipts[pid]
+		if !ok {
+			fmt.Fprintf(stdout, "  - %s    未回执\n", pid)
+			continue
+		}
+		if e.Result == resultFailed {
+			fmt.Fprintf(stdout, "  - %s    已回执    结果: %s    原因: %s    请求号: %s    时间: %s\n",
+				pid, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt))
+		} else {
+			fmt.Fprintf(stdout, "  - %s    已回执    结果: %s    请求号: %s    时间: %s\n",
+				pid, e.Result, e.Request, e.Time.Format(timeFmt))
+		}
+	}
 	return exitOK
 }

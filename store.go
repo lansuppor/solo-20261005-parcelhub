@@ -11,18 +11,34 @@ import (
 	"time"
 )
 
-// statusInStation 表示包裹当前在某站点（已收件或已完成交接）。
-const statusInStation = "在站"
+// 包裹状态。
+const (
+	// statusInStation 表示包裹当前在某站点（已收件、已完成交接或回执失败回到出发站）。
+	statusInStation = "在站"
+	// statusDelivering 表示包裹已随某个配送批次出站，正在配送中。
+	statusDelivering = "配送中"
+	// statusSigned 表示包裹已签收（回执结果为签收）。
+	statusSigned = "已签收"
+)
+
+// 回执结果。
+const (
+	resultSigned = "签收"
+	resultFailed = "失败"
+)
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执
 	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回请求号（收件记录为空）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执请求号（收件、出站记录为空）
 	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）
-	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）
+	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）或回执失败原因（仅失败回执有）
 	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）
+	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执记录有）
+	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站记录有）
+	Result     string    `json:"result,omitempty"`     // 回执结果：签收 | 失败（仅回执记录有）
 }
 
 // Parcel 是一件包裹的台账信息。
@@ -55,12 +71,46 @@ type ReturnResult struct {
 	Time    time.Time `json:"time"`
 }
 
+// ReceiptEntry 是批次内一件包裹的回执记录。
+type ReceiptEntry struct {
+	Request string    `json:"request"`          // 回执请求号
+	Result  string    `json:"result"`           // 签收 | 失败
+	Reason  string    `json:"reason,omitempty"` // 失败原因（仅失败回执有）
+	Time    time.Time `json:"time"`
+}
+
+// BatchResult 记录一次成功的配送批次出站，用于批次号去重、结果重放与批次查询。
+// 成员按首次提交时给出的顺序保存，保存后不可修改；批次完成后批次号也不能复用。
+type BatchResult struct {
+	Batch    string                   `json:"batch"`
+	Station  string                   `json:"station"`  // 出发站
+	Courier  string                   `json:"courier"`  // 配送员
+	Parcels  []string                 `json:"parcels"`  // 批次成员，按首次提交顺序
+	Time     time.Time                `json:"time"`     // 出站时间
+	Receipts map[string]*ReceiptEntry `json:"receipts"` // 逐件回执，按包裹编号索引（未回执的包裹不在其中）
+}
+
+// Done 报告批次是否已完成（全部成员均已回执）。
+func (b *BatchResult) Done() bool { return len(b.Receipts) == len(b.Parcels) }
+
+// ReceiptResult 记录一次成功的逐件回执，用于回执请求号去重与结果重放。
+type ReceiptResult struct {
+	Request string    `json:"request"` // 回执请求号
+	Batch   string    `json:"batch"`   // 所属配送批次号
+	Parcel  string    `json:"parcel"`  // 包裹编号
+	Result  string    `json:"result"`  // 签收 | 失败
+	Reason  string    `json:"reason,omitempty"`
+	Time    time.Time `json:"time"`
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
 	Version  int                       `json:"version"`
 	Parcels  map[string]*Parcel        `json:"parcels"`
 	Handoffs map[string]*HandoffResult `json:"handoffs"`
 	Returns  map[string]*ReturnResult  `json:"returns"`
+	Batches  map[string]*BatchResult   `json:"batches"`
+	Receipts map[string]*ReceiptResult `json:"receipts"`
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -83,7 +133,8 @@ func Open(path string) (*Store, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{}, Returns: map[string]*ReturnResult{}}
+			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
+				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -97,9 +148,20 @@ func Open(path string) (*Store, error) {
 	if s.data.Version != 1 || s.data.Parcels == nil || s.data.Handoffs == nil {
 		return nil, fmt.Errorf("%w: 缺少必要字段或版本不受支持", ErrCorrupt)
 	}
-	// 早期版本的数据文件没有 returns 字段：按空退回表处理，无需手工修改。
+	// 早期版本的数据文件没有 returns/batches/receipts 字段：按空表处理，无需手工修改。
 	if s.data.Returns == nil {
 		s.data.Returns = map[string]*ReturnResult{}
+	}
+	if s.data.Batches == nil {
+		s.data.Batches = map[string]*BatchResult{}
+	}
+	if s.data.Receipts == nil {
+		s.data.Receipts = map[string]*ReceiptResult{}
+	}
+	for _, b := range s.data.Batches {
+		if b != nil && b.Receipts == nil {
+			b.Receipts = map[string]*ReceiptEntry{}
+		}
 	}
 	if err := s.data.validate(); err != nil {
 		return nil, err
@@ -123,6 +185,25 @@ func (l *ledgerFile) validate() error {
 				}
 				if _, ok := l.Handoffs[e.RefRequest]; !ok {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条退回轨迹引用了不存在的原交接 %q", ErrCorrupt, id, i+1, e.RefRequest)
+				}
+			}
+			if e.Op == "出站" {
+				if e.Batch == "" || e.Courier == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条出站轨迹缺少批次号或配送员", ErrCorrupt, id, i+1)
+				}
+				if _, ok := l.Batches[e.Batch]; !ok {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条出站轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
+				}
+			}
+			if e.Op == "回执" {
+				if e.Batch == "" || e.Request == "" || (e.Result != resultSigned && e.Result != resultFailed) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条回执轨迹缺少批次号、请求号或结果无效", ErrCorrupt, id, i+1)
+				}
+				if e.Result == resultFailed && e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条失败回执轨迹缺少原因", ErrCorrupt, id, i+1)
+				}
+				if _, ok := l.Batches[e.Batch]; !ok {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条回执轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
 				}
 			}
 		}
@@ -159,6 +240,47 @@ func (l *ledgerFile) validate() error {
 			if _, ok := l.Parcels[id]; !ok {
 				return fmt.Errorf("%w: 退回请求号 %q 引用了不存在的包裹 %q", ErrCorrupt, req, id)
 			}
+		}
+	}
+	for id, b := range l.Batches {
+		if b == nil || id != b.Batch || b.Station == "" || b.Courier == "" || len(b.Parcels) == 0 || b.Time.IsZero() {
+			return fmt.Errorf("%w: 批次号 %q 的出站结果不完整", ErrCorrupt, id)
+		}
+		seen := make(map[string]bool, len(b.Parcels))
+		for _, pid := range b.Parcels {
+			if seen[pid] {
+				return fmt.Errorf("%w: 批次 %q 的成员 %q 重复", ErrCorrupt, id, pid)
+			}
+			seen[pid] = true
+			if _, ok := l.Parcels[pid]; !ok {
+				return fmt.Errorf("%w: 批次 %q 引用了不存在的包裹 %q", ErrCorrupt, id, pid)
+			}
+		}
+		for pid, e := range b.Receipts {
+			if e == nil || !seen[pid] || e.Request == "" || e.Time.IsZero() ||
+				(e.Result != resultSigned && e.Result != resultFailed) ||
+				(e.Result == resultFailed && e.Reason == "") || (e.Result == resultSigned && e.Reason != "") {
+				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执记录不完整", ErrCorrupt, id, pid)
+			}
+			rc, ok := l.Receipts[e.Request]
+			if !ok || rc.Batch != id || rc.Parcel != pid {
+				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执请求号 %q 无法对应", ErrCorrupt, id, pid, e.Request)
+			}
+		}
+	}
+	for req, rc := range l.Receipts {
+		if rc == nil || req != rc.Request || rc.Batch == "" || rc.Parcel == "" || rc.Time.IsZero() ||
+			(rc.Result != resultSigned && rc.Result != resultFailed) ||
+			(rc.Result == resultFailed && rc.Reason == "") || (rc.Result == resultSigned && rc.Reason != "") {
+			return fmt.Errorf("%w: 回执请求号 %q 的回执结果不完整", ErrCorrupt, req)
+		}
+		b, ok := l.Batches[rc.Batch]
+		if !ok {
+			return fmt.Errorf("%w: 回执请求号 %q 引用了不存在的批次 %q", ErrCorrupt, req, rc.Batch)
+		}
+		e, ok := b.Receipts[rc.Parcel]
+		if !ok || e.Request != req || e.Result != rc.Result || e.Reason != rc.Reason || !e.Time.Equal(rc.Time) {
+			return fmt.Errorf("%w: 回执请求号 %q 与批次 %q 的回执记录不一致", ErrCorrupt, req, rc.Batch)
 		}
 	}
 	return nil
@@ -219,6 +341,9 @@ func (s *Store) Handoff(request, from, to string, parcels []string, now time.Tim
 		}
 		if p.Station != from {
 			return nil, false, fmt.Errorf("交接失败：包裹 %q 当前归属 %q，不属于源站点 %q，整次交接未执行", id, p.Station, from)
+		}
+		if p.Status != statusInStation {
+			return nil, false, fmt.Errorf("交接失败：包裹 %q 当前状态为 %q，不是在站，整次交接未执行", id, p.Status)
 		}
 	}
 
@@ -354,6 +479,179 @@ func (s *Store) Return(request, handoffReq, reason string, now time.Time) (resul
 		return nil, false, err
 	}
 	return res, false, nil
+}
+
+// Dispatch 提交一次配送批次出站。
+//
+// 首次出站：所有包裹必须已登记、当前归属出发站且状态为在站，否则整批拒绝、不作任何改动；
+// 全部满足时整批转为“配送中”（站点仍记出发站），每件追加一条含批次、配送员和时间的
+// 出站记录，批次成员按首次提交顺序保存且不可修改。批次号标识一次配送，完成后也不能复用：
+// 相同批次号且站点、配送员、包裹集合（与顺序无关）相同，直接返回首次结果，replayed 为 true；
+// 批次号相同但内容不同报冲突；失败的首次出站不占用批次号。
+func (s *Store) Dispatch(batch, station, courier string, parcels []string, now time.Time) (result *BatchResult, replayed bool, err error) {
+	if saved, ok := s.data.Batches[batch]; ok {
+		if saved.Station == station && saved.Courier == courier && sameSet(saved.Parcels, parcels) {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("批次号 %q 已用于一次不同的出站（出发站=%q 配送员=%q），内容冲突", batch, saved.Station, saved.Courier)
+	}
+
+	// 首次出站：先做全部校验，任何一件不满足都整批拒绝。
+	for _, id := range parcels {
+		p, ok := s.data.Parcels[id]
+		if !ok {
+			return nil, false, fmt.Errorf("出站失败：包裹 %q 未登记，整批出站未执行", id)
+		}
+		if p.Station != station {
+			return nil, false, fmt.Errorf("出站失败：包裹 %q 当前归属 %q，不在出发站 %q，整批出站未执行", id, p.Station, station)
+		}
+		if p.Status != statusInStation {
+			return nil, false, fmt.Errorf("出站失败：包裹 %q 当前状态为 %q，不是在站，整批出站未执行", id, p.Status)
+		}
+	}
+
+	res := &BatchResult{
+		Batch:    batch,
+		Station:  station,
+		Courier:  courier,
+		Parcels:  append([]string(nil), parcels...),
+		Time:     now,
+		Receipts: map[string]*ReceiptEntry{},
+	}
+	s.data.Batches[batch] = res
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string]struct {
+		status string
+		trail  []Event
+	}, len(parcels))
+	for _, id := range parcels {
+		p := s.data.Parcels[id]
+		prev[id] = struct {
+			status string
+			trail  []Event
+		}{p.Status, append([]Event(nil), p.Trail...)}
+		p.Status = statusDelivering // 站点不变，仍记出发站
+		p.Trail = append(p.Trail, Event{
+			Op:      "出站",
+			Station: station,
+			Batch:   batch,
+			Courier: courier,
+			Time:    now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Batches, batch)
+		for id, old := range prev {
+			p := s.data.Parcels[id]
+			p.Status = old.status
+			p.Trail = old.trail
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// Receipt 提交一件包裹在某个配送批次下的回执。
+//
+// 首次回执：批次必须存在，包裹必须属于该批次、尚未在该批次回执，且当前仍在该批次
+// 配送中；任一不满足则拒绝，不作任何改动。签收后状态为“已签收”；失败表示实物已回到
+// 出发站，恢复“在站”，可加入新的配送批次。两种结果都保留站点并追加一条含批次、结果、
+// 原因（失败时）、请求号和时间的回执记录；全部成员回执后批次自动完成。
+// 相同回执请求号且批次、包裹、结果、清理后的原因相同：直接返回首次结果，replayed 为
+// true，不重新检查当前状态，即使失败包裹已进入新批次；请求号相同但内容不同报冲突。
+// 回执请求号与批次号、包裹编号、交接及退回请求号分属独立去重范围，允许同名；
+// 失败的首次回执不占用请求号。
+func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.Time) (res *ReceiptResult, replayed bool, err error) {
+	if saved, ok := s.data.Receipts[request]; ok {
+		if saved.Batch == batch && saved.Parcel == parcel && saved.Result == result && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("回执请求号 %q 已用于一次不同的回执（批次=%q 包裹=%q 结果=%q），内容冲突",
+			request, saved.Batch, saved.Parcel, saved.Result)
+	}
+
+	b, ok := s.data.Batches[batch]
+	if !ok {
+		return nil, false, fmt.Errorf("回执失败：批次号 %q 不存在", batch)
+	}
+	member := false
+	for _, id := range b.Parcels {
+		if id == parcel {
+			member = true
+			break
+		}
+	}
+	if !member {
+		return nil, false, fmt.Errorf("回执失败：包裹 %q 不属于批次 %q", parcel, batch)
+	}
+	if _, done := b.Receipts[parcel]; done {
+		return nil, false, fmt.Errorf("回执失败：包裹 %q 在批次 %q 中已回执，每件在一个批次只能成功回执一次", parcel, batch)
+	}
+	p := s.data.Parcels[parcel] // 批次成员必已登记（载入校验保证）
+	if p.Status != statusDelivering || currentBatch(p) != batch {
+		return nil, false, fmt.Errorf("回执失败：包裹 %q 当前状态为 %q，不在批次 %q 配送中", parcel, p.Status, batch)
+	}
+
+	res = &ReceiptResult{
+		Request: request,
+		Batch:   batch,
+		Parcel:  parcel,
+		Result:  result,
+		Reason:  reason,
+		Time:    now,
+	}
+	entry := &ReceiptEntry{Request: request, Result: result, Reason: reason, Time: now}
+
+	// 记录旧值，落盘失败时整体回滚。
+	oldStatus, oldStation := p.Status, p.Station
+	oldTrail := append([]Event(nil), p.Trail...)
+
+	if result == resultSigned {
+		p.Status = statusSigned // 站点保留不变
+	} else {
+		p.Status = statusInStation // 实物已回到出发站，可加入新的配送批次
+		p.Station = b.Station
+	}
+	p.Trail = append(p.Trail, Event{
+		Op:      "回执",
+		Station: p.Station,
+		Batch:   batch,
+		Result:  result,
+		Reason:  reason,
+		Request: request,
+		Time:    now,
+	})
+	b.Receipts[parcel] = entry
+	s.data.Receipts[request] = res
+
+	if err := s.save(); err != nil {
+		delete(s.data.Receipts, request)
+		delete(b.Receipts, parcel)
+		p.Status, p.Station, p.Trail = oldStatus, oldStation, oldTrail
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// currentBatch 返回包裹当前配送中的批次号（最后一条出站记录的批次）；不在配送中返回空。
+func currentBatch(p *Parcel) string {
+	for i := len(p.Trail) - 1; i >= 0; i-- {
+		if p.Trail[i].Op == "出站" {
+			return p.Trail[i].Batch
+		}
+	}
+	return ""
+}
+
+// BatchQuery 返回一个配送批次的出站结果与逐件回执进度；批次不存在时报错。
+func (s *Store) BatchQuery(batch string) (*BatchResult, error) {
+	b, ok := s.data.Batches[batch]
+	if !ok {
+		return nil, fmt.Errorf("批次 %q 不存在", batch)
+	}
+	return b, nil
 }
 
 // sameSet 判断两个包裹列表作为集合是否相同（顺序不影响判定）。
