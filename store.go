@@ -807,6 +807,146 @@ func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.
 	return res, false, nil
 }
 
+// ReceiptInput 是整批导入文件中的一条回执记录（各字段须已清理）。
+type ReceiptInput struct {
+	Request string // 回执请求号
+	Batch   string // 配送批次号
+	Parcel  string // 包裹编号
+	Result  string // 签收 | 失败
+	Reason  string // 失败原因（仅失败回执有）
+}
+
+// ImportReceiptItem 是整批导入中一条记录的处理结果。
+type ImportReceiptItem struct {
+	Result   *ReceiptResult // 该条的回执结果（重放时为首次保存的结果）
+	Replayed bool           // true 表示请求号已存在且内容相同，返回首次结果，未再改动
+}
+
+// ImportReceipts 按给定顺序整批应用一组回执记录（字段须已清理，记录不可为空）。
+//
+// 逐条处理：请求号已存在且批次、包裹、结果、清理后的原因相同，直接返回首次结果，
+// 不检查当前状态、不追加记录、不改变批次进度；请求号相同但内容不同报冲突。
+// 新请求号按首次回执受理：批次必须存在，包裹必须属于该批次、尚未在该批次回执，
+// 且当前仍在该批次配送中；同一份文件用不同请求号再次回执同一批次同一包裹也整份拒绝。
+// 任一记录无效或冲突，整份拒绝：本次新增的包裹变更、轨迹、批次回执和请求结果全部撤销，
+// 导入前已存在的成功结果保留，新请求号均不占用。全部可接受时一次性整体原子落盘；
+// 全部为历史重放时不改写台账。
+func (s *Store) ImportReceipts(records []ReceiptInput, now time.Time) ([]ImportReceiptItem, error) {
+	items := make([]ImportReceiptItem, 0, len(records))
+	seenReq := make(map[string]int, len(records))
+
+	// 记录本次新增回执改动的旧值，任一记录失败或落盘失败时整体回滚。
+	type applied struct {
+		request    string
+		batch      *BatchResult
+		parcel     *Parcel
+		oldStatus  string
+		oldStation string
+		oldTrail   []Event
+	}
+	var done []applied
+	rollback := func() {
+		for i := len(done) - 1; i >= 0; i-- {
+			a := done[i]
+			delete(s.data.Receipts, a.request)
+			delete(a.batch.Receipts, a.parcel.ID)
+			a.parcel.Status, a.parcel.Station, a.parcel.Trail = a.oldStatus, a.oldStation, a.oldTrail
+		}
+	}
+
+	for i, r := range records {
+		pos := i + 1
+		if prev, dup := seenReq[r.Request]; dup {
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：与第 %d 条记录的请求号重复，文件内请求号不可重复，整份导入未执行", pos, r.Request, prev)
+		}
+		seenReq[r.Request] = pos
+
+		if saved, ok := s.data.Receipts[r.Request]; ok {
+			if saved.Batch == r.Batch && saved.Parcel == r.Parcel && saved.Result == r.Result && saved.Reason == r.Reason {
+				items = append(items, ImportReceiptItem{Result: saved, Replayed: true})
+				continue
+			}
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：该请求号已用于一次不同的回执（批次=%q 包裹=%q 结果=%q），内容冲突，整份导入未执行",
+				pos, r.Request, saved.Batch, saved.Parcel, saved.Result)
+		}
+
+		b, ok := s.data.Batches[r.Batch]
+		if !ok {
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：批次号 %q 不存在，整份导入未执行", pos, r.Request, r.Batch)
+		}
+		member := false
+		for _, id := range b.Parcels {
+			if id == r.Parcel {
+				member = true
+				break
+			}
+		}
+		if !member {
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：包裹 %q 不属于批次 %q，整份导入未执行", pos, r.Request, r.Parcel, r.Batch)
+		}
+		if _, dup := b.Receipts[r.Parcel]; dup {
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：包裹 %q 在批次 %q 中已回执，每件在一个批次只能成功回执一次，整份导入未执行",
+				pos, r.Request, r.Parcel, r.Batch)
+		}
+		p := s.data.Parcels[r.Parcel] // 批次成员必已登记（载入校验保证）
+		if p.Status != statusDelivering || currentBatch(p) != r.Batch {
+			rollback()
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：包裹 %q 当前状态为 %q，不在批次 %q 配送中，整份导入未执行",
+				pos, r.Request, r.Parcel, p.Status, r.Batch)
+		}
+
+		res := &ReceiptResult{
+			Request: r.Request,
+			Batch:   r.Batch,
+			Parcel:  r.Parcel,
+			Result:  r.Result,
+			Reason:  r.Reason,
+			Time:    now,
+		}
+		done = append(done, applied{
+			request:    r.Request,
+			batch:      b,
+			parcel:     p,
+			oldStatus:  p.Status,
+			oldStation: p.Station,
+			oldTrail:   append([]Event(nil), p.Trail...),
+		})
+
+		if r.Result == resultSigned {
+			p.Status = statusSigned // 站点保留不变
+		} else {
+			p.Status = statusInStation // 实物已回到出发站，可加入新的配送批次
+			p.Station = b.Station
+		}
+		p.Trail = append(p.Trail, Event{
+			Op:      "回执",
+			Station: p.Station,
+			Batch:   r.Batch,
+			Result:  r.Result,
+			Reason:  r.Reason,
+			Request: r.Request,
+			Time:    now,
+		})
+		b.Receipts[r.Parcel] = &ReceiptEntry{Request: r.Request, Result: r.Result, Reason: r.Reason, Time: now}
+		s.data.Receipts[r.Request] = res
+		items = append(items, ImportReceiptItem{Result: res})
+	}
+
+	if len(done) == 0 {
+		return items, nil // 全部为历史重放，不改写台账
+	}
+	if err := s.save(); err != nil {
+		rollback()
+		return nil, err
+	}
+	return items, nil
+}
+
 // Freeze 对一件在站包裹登记异常冻结。
 //
 // 首次冻结：包裹必须已登记、当前归属指定站点且状态为在站；配送中、已签收或已冻结的
