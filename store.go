@@ -19,6 +19,8 @@ const (
 	statusDelivering = "配送中"
 	// statusSigned 表示包裹已签收（回执结果为签收）。
 	statusSigned = "已签收"
+	// statusFrozen 表示包裹因异常单被冻结在站（不移动实物，解除后恢复在站）。
+	statusFrozen = "异常冻结"
 )
 
 // 回执结果。
@@ -29,16 +31,18 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除
 	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回/回执请求号（收件、出站记录为空）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/解除请求号（收件、出站、冻结记录为空）
 	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）
-	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）或回执失败原因（仅失败回执有）
+	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）或冻结原因（仅冻结记录有）
 	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）
 	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执记录有）
 	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站记录有）
 	Result     string    `json:"result,omitempty"`     // 回执结果：签收 | 失败（仅回执记录有）
+	Exception  string    `json:"exception,omitempty"`  // 异常单号（仅冻结、解除记录有）
+	Note       string    `json:"note,omitempty"`       // 处理说明（仅解除记录有）
 }
 
 // Parcel 是一件包裹的台账信息。
@@ -48,6 +52,9 @@ type Parcel struct {
 	Status     string    `json:"status"`     // 当前状态
 	Registered time.Time `json:"registered"` // 收件时间
 	Trail      []Event   `json:"trail"`      // 完整轨迹，按提交顺序排列
+	// FrozenBy 是当前未解除冻结对应的异常单号（未冻结为空）；
+	// 冻结与解除只是管理记录，不算新的流转。
+	FrozenBy string `json:"frozenBy,omitempty"`
 }
 
 // HandoffResult 记录一次成功交接，用于请求号去重与结果重放。
@@ -103,14 +110,37 @@ type ReceiptResult struct {
 	Time    time.Time `json:"time"`
 }
 
+// FreezeResult 记录一次成功的异常冻结，用于异常单号去重与结果重放。
+// 异常单号标识一次异常，解除后也不能复用；记录保存后不可修改，
+// 解除时仅把 ReleasedBy 标记为对应的解除请求号。
+type FreezeResult struct {
+	Exception  string    `json:"exception"` // 异常单号
+	Parcel     string    `json:"parcel"`    // 被冻结的包裹编号
+	Station    string    `json:"station"`   // 冻结时所在站点（冻结期间站点不变）
+	Reason     string    `json:"reason"`    // 冻结原因
+	Time       time.Time `json:"time"`
+	ReleasedBy string    `json:"releasedBy,omitempty"` // 已解除该冻结的解除请求号（未解除为空）
+}
+
+// UnfreezeResult 记录一次成功的异常解除，用于解除请求号去重与结果重放。
+// 解除请求号独立去重，可与异常单号、包裹号及其他业务编号同名。
+type UnfreezeResult struct {
+	Request   string    `json:"request"`   // 解除请求号
+	Exception string    `json:"exception"` // 被解除的异常单号
+	Note      string    `json:"note"`      // 处理说明
+	Time      time.Time `json:"time"`
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
-	Version  int                       `json:"version"`
-	Parcels  map[string]*Parcel        `json:"parcels"`
-	Handoffs map[string]*HandoffResult `json:"handoffs"`
-	Returns  map[string]*ReturnResult  `json:"returns"`
-	Batches  map[string]*BatchResult   `json:"batches"`
-	Receipts map[string]*ReceiptResult `json:"receipts"`
+	Version   int                        `json:"version"`
+	Parcels   map[string]*Parcel         `json:"parcels"`
+	Handoffs  map[string]*HandoffResult  `json:"handoffs"`
+	Returns   map[string]*ReturnResult   `json:"returns"`
+	Batches   map[string]*BatchResult    `json:"batches"`
+	Receipts  map[string]*ReceiptResult  `json:"receipts"`
+	Freezes   map[string]*FreezeResult   `json:"freezes"`
+	Unfreezes map[string]*UnfreezeResult `json:"unfreezes"`
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -134,7 +164,8 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
-				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{}}
+				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{},
+				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -148,7 +179,7 @@ func Open(path string) (*Store, error) {
 	if s.data.Version != 1 || s.data.Parcels == nil || s.data.Handoffs == nil {
 		return nil, fmt.Errorf("%w: 缺少必要字段或版本不受支持", ErrCorrupt)
 	}
-	// 早期版本的数据文件没有 returns/batches/receipts 字段：按空表处理，无需手工修改。
+	// 早期版本的数据文件没有 returns/batches/receipts/freezes/unfreezes 字段：按空表处理，无需手工修改。
 	if s.data.Returns == nil {
 		s.data.Returns = map[string]*ReturnResult{}
 	}
@@ -157,6 +188,12 @@ func Open(path string) (*Store, error) {
 	}
 	if s.data.Receipts == nil {
 		s.data.Receipts = map[string]*ReceiptResult{}
+	}
+	if s.data.Freezes == nil {
+		s.data.Freezes = map[string]*FreezeResult{}
+	}
+	if s.data.Unfreezes == nil {
+		s.data.Unfreezes = map[string]*UnfreezeResult{}
 	}
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
@@ -174,6 +211,18 @@ func (l *ledgerFile) validate() error {
 	for id, p := range l.Parcels {
 		if p == nil || id != p.ID || p.Station == "" || p.Status == "" || len(p.Trail) == 0 {
 			return fmt.Errorf("%w: 包裹 %q 记录不完整", ErrCorrupt, id)
+		}
+		if p.FrozenBy != "" {
+			f, ok := l.Freezes[p.FrozenBy]
+			if !ok || f == nil {
+				return fmt.Errorf("%w: 包裹 %q 的当前冻结引用了不存在的异常单 %q", ErrCorrupt, id, p.FrozenBy)
+			}
+			if f.Parcel != id || f.Station != p.Station || f.ReleasedBy != "" || p.Status != statusFrozen {
+				return fmt.Errorf("%w: 包裹 %q 的当前冻结与异常单 %q 的记录不匹配", ErrCorrupt, id, p.FrozenBy)
+			}
+		}
+		if p.Status == statusFrozen && p.FrozenBy == "" {
+			return fmt.Errorf("%w: 包裹 %q 状态为异常冻结但缺少对应异常单", ErrCorrupt, id)
 		}
 		for i, e := range p.Trail {
 			if e.Op == "" || e.Station == "" || e.Time.IsZero() {
@@ -204,6 +253,24 @@ func (l *ledgerFile) validate() error {
 				}
 				if _, ok := l.Batches[e.Batch]; !ok {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条回执轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
+				}
+			}
+			if e.Op == "冻结" {
+				if e.Exception == "" || e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条冻结轨迹缺少异常单号或原因", ErrCorrupt, id, i+1)
+				}
+				f, ok := l.Freezes[e.Exception]
+				if !ok || f == nil || f.Parcel != id {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条冻结轨迹引用了不存在或不匹配的异常单 %q", ErrCorrupt, id, i+1, e.Exception)
+				}
+			}
+			if e.Op == "解除" {
+				if e.Exception == "" || e.Request == "" || e.Note == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除轨迹缺少异常单号、解除请求号或处理说明", ErrCorrupt, id, i+1)
+				}
+				u, ok := l.Unfreezes[e.Request]
+				if !ok || u == nil || u.Exception != e.Exception {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除轨迹引用了不存在或不匹配的解除请求号 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
 		}
@@ -281,6 +348,29 @@ func (l *ledgerFile) validate() error {
 		e, ok := b.Receipts[rc.Parcel]
 		if !ok || e.Request != req || e.Result != rc.Result || e.Reason != rc.Reason || !e.Time.Equal(rc.Time) {
 			return fmt.Errorf("%w: 回执请求号 %q 与批次 %q 的回执记录不一致", ErrCorrupt, req, rc.Batch)
+		}
+	}
+	for ex, f := range l.Freezes {
+		if f == nil || ex != f.Exception || f.Parcel == "" || f.Station == "" || f.Reason == "" || f.Time.IsZero() {
+			return fmt.Errorf("%w: 异常单号 %q 的冻结结果不完整", ErrCorrupt, ex)
+		}
+		if _, ok := l.Parcels[f.Parcel]; !ok {
+			return fmt.Errorf("%w: 异常单号 %q 引用了不存在的包裹 %q", ErrCorrupt, ex, f.Parcel)
+		}
+		if f.ReleasedBy != "" {
+			u, ok := l.Unfreezes[f.ReleasedBy]
+			if !ok || u == nil || u.Exception != ex {
+				return fmt.Errorf("%w: 异常单号 %q 标记的解除请求号 %q 无法对应", ErrCorrupt, ex, f.ReleasedBy)
+			}
+		}
+	}
+	for req, u := range l.Unfreezes {
+		if u == nil || req != u.Request || u.Exception == "" || u.Note == "" || u.Time.IsZero() {
+			return fmt.Errorf("%w: 解除请求号 %q 的解除结果不完整", ErrCorrupt, req)
+		}
+		f, ok := l.Freezes[u.Exception]
+		if !ok || f == nil || f.ReleasedBy != req {
+			return fmt.Errorf("%w: 解除请求号 %q 与异常单 %q 的记录不一致", ErrCorrupt, req, u.Exception)
 		}
 	}
 	return nil
@@ -392,7 +482,8 @@ func (s *Store) Handoff(request, from, to string, parcels []string, now time.Tim
 // Return 按原交接整批退回：实物送回该交接的源站点，批次与站点取自原交接结果。
 //
 // 首次退回：原交接必须存在且尚未成功退回；批次中每件包裹必须仍归属原交接目的站、
-// 状态为在站，且最后一条流转记录就是该原交接（请求重放不产生新流转，不影响判定）。
+// 状态为在站，且最后一条流转记录就是该原交接（请求重放不产生新流转，冻结与解除
+// 只是管理记录、也不算新流转，均不影响判定）。
 // 任一条件不满足则整批拒绝，不作任何改动。全部满足时整批改归原交接源站（仍为在站），
 // 每件按批次顺序追加一条退回记录，原收件、交接轨迹保留不变。
 // 相同退回请求号且原交接、原因相同：直接返回首次结果，replayed 为 true，
@@ -425,8 +516,8 @@ func (s *Store) Return(request, handoffReq, reason string, now time.Time) (resul
 			return nil, false, fmt.Errorf("退回失败：包裹 %q 当前归属 %q、状态 %q，不在原交接目的站 %q 在站，整批退回未执行",
 				id, p.Station, p.Status, h.To)
 		}
-		last := p.Trail[len(p.Trail)-1]
-		if last.Op != "交接" || last.Request != handoffReq {
+		last := lastFlow(p)
+		if last == nil || last.Op != "交接" || last.Request != handoffReq {
 			return nil, false, fmt.Errorf("退回失败：包裹 %q 在原交接 %q 之后又有新的流转，不能退回该交接，整批退回未执行",
 				id, handoffReq)
 		}
@@ -633,6 +724,153 @@ func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.
 		return nil, false, err
 	}
 	return res, false, nil
+}
+
+// Freeze 提交一次在站包裹的异常冻结。
+//
+// 首次冻结：包裹必须已登记、当前归属指定站点且状态为在站，否则拒绝、不作任何改动；
+// 配送中或已签收的包裹不能冻结，一件包裹同时只能有一张未解除异常单。
+// 成功后站点不变，状态转为“异常冻结”，追加一条含异常单号、原因、站点和时间的冻结记录；
+// 冻结只是管理记录，不移动实物、不算新的流转。异常单号标识一次异常，解除后也不能复用：
+// 相同异常单号且包裹、站点、清理后的原因相同，直接返回首次结果及时间，replayed 为 true，
+// 不再次冻结；异常单号相同但内容不同报冲突；失败的首次冻结不占用异常单号。
+// 异常单号与包裹号及已有业务编号分属独立去重范围，允许同名。
+func (s *Store) Freeze(exception, parcel, station, reason string, now time.Time) (result *FreezeResult, replayed bool, err error) {
+	if saved, ok := s.data.Freezes[exception]; ok {
+		if saved.Parcel == parcel && saved.Station == station && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("异常单号 %q 已用于一次不同的冻结（包裹=%q 站点=%q），内容冲突",
+			exception, saved.Parcel, saved.Station)
+	}
+
+	p, ok := s.data.Parcels[parcel]
+	if !ok {
+		return nil, false, fmt.Errorf("冻结失败：包裹 %q 未登记", parcel)
+	}
+	if p.Station != station {
+		return nil, false, fmt.Errorf("冻结失败：包裹 %q 当前归属 %q，不在指定站点 %q", parcel, p.Station, station)
+	}
+	if p.Status == statusFrozen {
+		return nil, false, fmt.Errorf("冻结失败：包裹 %q 已因异常单 %q 处于异常冻结，一件包裹同时只能有一张未解除异常单",
+			parcel, p.FrozenBy)
+	}
+	if p.Status != statusInStation {
+		return nil, false, fmt.Errorf("冻结失败：包裹 %q 当前状态为 %q，不是在站，不能冻结", parcel, p.Status)
+	}
+
+	res := &FreezeResult{
+		Exception: exception,
+		Parcel:    parcel,
+		Station:   station,
+		Reason:    reason,
+		Time:      now,
+	}
+	s.data.Freezes[exception] = res
+
+	// 记录旧值，落盘失败时整体回滚。
+	oldStatus, oldFrozenBy := p.Status, p.FrozenBy
+	oldTrail := append([]Event(nil), p.Trail...)
+
+	p.Status = statusFrozen // 站点不变
+	p.FrozenBy = exception
+	p.Trail = append(p.Trail, Event{
+		Op:        "冻结",
+		Station:   station,
+		Exception: exception,
+		Reason:    reason,
+		Time:      now,
+	})
+
+	if err := s.save(); err != nil {
+		delete(s.data.Freezes, exception)
+		p.Status, p.FrozenBy, p.Trail = oldStatus, oldFrozenBy, oldTrail
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// Unfreeze 提交一次异常解除：把包裹从异常冻结恢复为在原站在站。
+//
+// 首次解除：异常单必须存在、尚未解除，并且仍是该包裹当前冻结对应的异常单；
+// 任一不满足则拒绝，不作任何改动。成功后包裹在原站恢复“在站”，原异常单永久
+// 标记为已解除，追加一条含异常单号、解除请求号、处理说明及时间的解除记录，
+// 原冻结记录不删改；解除只是管理记录，不移动实物、不算新的流转。
+// 之后可用新异常单再次冻结同一包裹。
+// 解除请求号独立去重，可与异常单号、包裹号及其他业务编号同名：相同请求号且
+// 异常单、清理后的处理说明相同，直接返回首次结果及时间，replayed 为 true，
+// 不检查当前状态，也不影响后来新建的异常单或后续流转；请求号相同但内容不同
+// 报冲突；失败的首次解除不占用请求号。
+func (s *Store) Unfreeze(request, exception, note string, now time.Time) (result *UnfreezeResult, replayed bool, err error) {
+	if saved, ok := s.data.Unfreezes[request]; ok {
+		if saved.Exception == exception && saved.Note == note {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("解除请求号 %q 已用于一次不同的解除（异常单=%q），内容冲突",
+			request, saved.Exception)
+	}
+
+	f, ok := s.data.Freezes[exception]
+	if !ok {
+		return nil, false, fmt.Errorf("解除失败：异常单号 %q 不存在", exception)
+	}
+	if f.ReleasedBy != "" {
+		return nil, false, fmt.Errorf("解除失败：异常单 %q 已解除（解除请求号 %q），不能再次解除", exception, f.ReleasedBy)
+	}
+	p := s.data.Parcels[f.Parcel] // 冻结引用的包裹必已登记（载入校验保证）
+	if p.Status != statusFrozen || p.FrozenBy != exception {
+		return nil, false, fmt.Errorf("解除失败：异常单 %q 不是包裹 %q 当前冻结对应的异常单", exception, f.Parcel)
+	}
+
+	res := &UnfreezeResult{
+		Request:   request,
+		Exception: exception,
+		Note:      note,
+		Time:      now,
+	}
+	s.data.Unfreezes[request] = res
+
+	// 记录旧值，落盘失败时整体回滚。
+	oldStatus, oldFrozenBy := p.Status, p.FrozenBy
+	oldTrail := append([]Event(nil), p.Trail...)
+
+	f.ReleasedBy = request
+	p.Status = statusInStation // 在原站恢复在站，站点不变
+	p.FrozenBy = ""
+	p.Trail = append(p.Trail, Event{
+		Op:        "解除",
+		Station:   p.Station,
+		Exception: exception,
+		Request:   request,
+		Note:      note,
+		Time:      now,
+	})
+
+	if err := s.save(); err != nil {
+		delete(s.data.Unfreezes, request)
+		f.ReleasedBy = ""
+		p.Status, p.FrozenBy, p.Trail = oldStatus, oldFrozenBy, oldTrail
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// FreezeQuery 返回一张异常单的冻结结果；不存在时返回 nil, false。
+func (s *Store) FreezeQuery(exception string) (*FreezeResult, bool) {
+	f, ok := s.data.Freezes[exception]
+	return f, ok
+}
+
+// lastFlow 返回包裹最后一条流转记录（收件/交接/退回/出站/回执）；
+// 冻结与解除只是管理记录，不算流转，判定时跳过。无流转记录时返回 nil。
+func lastFlow(p *Parcel) *Event {
+	for i := len(p.Trail) - 1; i >= 0; i-- {
+		switch p.Trail[i].Op {
+		case "收件", "交接", "退回", "出站", "回执":
+			return &p.Trail[i]
+		}
+	}
+	return nil
 }
 
 // currentBatch 返回包裹当前配送中的批次号（最后一条出站记录的批次）；不在配送中返回空。

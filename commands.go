@@ -102,8 +102,15 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	fmt.Fprintf(stdout, "包裹编号: %s\n当前站点: %s\n当前状态: %s\n轨迹（按提交顺序，共 %d 条）:\n",
-		p.ID, p.Station, p.Status, len(p.Trail))
+	fmt.Fprintf(stdout, "包裹编号: %s\n当前站点: %s\n当前状态: %s\n",
+		p.ID, p.Station, p.Status)
+	if p.Status == statusFrozen {
+		if f, ok := store.FreezeQuery(p.FrozenBy); ok {
+			fmt.Fprintf(stdout, "当前异常（未解除）:\n  异常单号: %s\n  冻结原因: %s\n  所在站点: %s\n  冻结时间: %s\n",
+				f.Exception, f.Reason, f.Station, f.Time.Format(timeFmt))
+		}
+	}
+	fmt.Fprintf(stdout, "轨迹（按提交顺序，共 %d 条）:\n", len(p.Trail))
 	for i, e := range p.Trail {
 		switch e.Op {
 		case "退回":
@@ -120,6 +127,12 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    请求号: %s    时间: %s\n",
 					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt))
 			}
+		case "冻结":
+			fmt.Fprintf(stdout, "  %d. 操作: 冻结    站点: %s    异常单号: %s    原因: %s    时间: %s\n",
+				i+1, e.Station, e.Exception, e.Reason, e.Time.Format(timeFmt))
+		case "解除":
+			fmt.Fprintf(stdout, "  %d. 操作: 解除    站点: %s    异常单号: %s    解除请求号: %s    处理说明: %s    时间: %s\n",
+				i+1, e.Station, e.Exception, e.Request, e.Note, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -403,6 +416,105 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "原因: %s\n", res.Reason)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdFreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("freeze", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	exception := fs.String("exception", "", "异常单号（用于去重，解除后也不能复用）")
+	parcel := fs.String("parcel", "", "包裹编号")
+	station := fs.String("station", "", "所在站点")
+	reason := fs.String("reason", "", "冻结原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printFreezeHelp); !ok {
+		return code
+	}
+
+	cleanException, err := cleanID("异常单号", *exception)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanParcel, err := cleanID("包裹编号", *parcel)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanStation, err := cleanID("所在站点", *station)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("冻结原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	result, replayed, err := store.Freeze(cleanException, cleanParcel, cleanStation, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "冻结成功"
+	if replayed {
+		headline = "冻结成功（异常单号重复提交，返回首次保存的结果，未再次冻结）"
+	}
+	fmt.Fprintf(stdout, "%s\n异常单号: %s\n包裹编号: %s\n所在站点: %s\n冻结原因: %s\n发生时间: %s\n",
+		headline, result.Exception, result.Parcel, result.Station, result.Reason, result.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdUnfreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("unfreeze", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "解除请求号（独立去重，可与其他编号同名）")
+	exception := fs.String("exception", "", "要解除的异常单号")
+	note := fs.String("note", "", "处理说明")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printUnfreezeHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("解除请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanException, err := cleanID("异常单号", *exception)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanNote, err := cleanID("处理说明", *note)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
+		return exitBusiness
+	}
+	result, replayed, err := store.Unfreeze(cleanReq, cleanException, cleanNote, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "解除成功"
+	if replayed {
+		headline = "解除成功（请求号重复提交，返回首次保存的结果，未再追加记录）"
+	}
+	f, _ := store.FreezeQuery(result.Exception)
+	fmt.Fprintf(stdout, "%s\n解除请求号: %s\n异常单号: %s\n包裹编号: %s\n所在站点: %s\n处理说明: %s\n发生时间: %s\n",
+		headline, result.Request, result.Exception, f.Parcel, f.Station, result.Note, result.Time.Format(timeFmt))
 	return exitOK
 }
 
