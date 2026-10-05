@@ -88,6 +88,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReceipt(dataFile, rest[1:], stdout, stderr)
 	case "batch":
 		return cmdBatch(dataFile, rest[1:], stdout, stderr)
+	case "freeze":
+		return cmdFreeze(dataFile, rest[1:], stdout, stderr)
+	case "unfreeze":
+		return cmdUnfreeze(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -122,6 +126,8 @@ func printHelp(w io.Writer) {
   dispatch               配送批次出站：整批包裹转为“配送中”，批次成员保存后不可修改
   receipt                逐件回执：签收或失败（失败须给原因）；全部回执后批次自动完成
   batch                  按批次号查询成员、配送员、出站时间与逐件回执进度
+  freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
+  unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
 
 常用示例:
   %s register --id P001 --station 站点A
@@ -134,10 +140,12 @@ func printHelp(w io.Writer) {
   %s receipt  --request RC1 --batch B1 --parcel P001 --result 签收
   %s receipt  --request RC2 --batch B1 --parcel P002 --result 失败 --reason 收件人不在
   %s batch    --id B1
+  %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
+  %s unfreeze --request U1 --incident E1 --note 已核实放行
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -162,11 +170,12 @@ func printQueryHelp(w io.Writer) {
 用法:
   %s query [--data FILE] --id 包裹编号
 
-展示当前站点、当前状态及按提交顺序排列的完整轨迹；
+展示当前站点、当前状态、当前未解除异常（若有）及按提交顺序排列的完整轨迹；
 交接记录同时显示请求号；退回记录同时显示源站、目的站、
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
-与请求号。包裹不存在时报错，不会创建记录。
+与请求号；冻结记录显示异常单号、原因、站点和时间；解除冻结记录
+显示异常单号、解除请求号、处理说明和时间。包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -281,5 +290,56 @@ func printBatchHelp(w io.Writer) {
 
 示例:
   %s batch --id B1
+`, appName, appName, appName)
+}
+
+func printFreezeHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s freeze — 在站包裹异常冻结
+
+用法:
+  %s freeze [--data FILE] --incident 异常单号 --parcel 包裹编号 \
+             --station 所在站点 --reason 异常原因
+
+规则:
+  - 异常单号、包裹编号、所在站点、异常原因均去除两端空白，不可为空或仅含空白
+  - 首次冻结：包裹必须已登记、在指定站点且状态为在站；
+    配送中或已签收的包裹不能冻结
+  - 成功后站点不变，状态转为“异常冻结”，追加一条含异常单号、
+    原因、站点和时间的冻结记录；一件包裹同时只能有一张未解除异常单
+  - 冻结期间，包含该包裹的首次交接、配送出站或整批退回整批拒绝，
+    其余成员的状态、轨迹和相关结果均不变
+  - 冻结只是管理记录，不移动实物、不算新流转
+  - 异常单号标识一次异常，解除后也不能复用：相同异常单号且包裹、站点、
+    清理后的原因相同，直接返回首次冻结结果与时间，不再次冻结；
+    异常单号相同但内容不同报冲突；失败的冻结不占用异常单号
+  - 异常单号与包裹编号及其他业务编号分属独立去重范围，允许同名
+
+示例:
+  %s freeze --incident E1 --parcel P001 --station 站点A --reason 外包装破损
+`, appName, appName, appName)
+}
+
+func printUnfreezeHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s unfreeze — 解除异常冻结
+
+用法:
+  %s unfreeze [--data FILE] --request 解除请求号 --incident 异常单号 --note 处理说明
+
+规则:
+  - 解除请求号、异常单号、处理说明均去除两端空白，不可为空或仅含空白
+  - 首次解除：异常单必须存在且尚未解除，并且仍是该包裹当前冻结对应的
+    异常单；异常单不存在、已解除或对应关系不符均拒绝
+  - 成功后包裹在原站恢复“在站”，原异常单永久标记为已解除（不可复用），
+    追加一条含异常单号、解除请求号、处理说明及时间的记录，原冻结记录不删改；
+    之后可用新异常单再次冻结
+  - 解除只是管理记录，不移动实物、不算新流转；解除后若没有其他新流转，
+    原本可退回的交接仍可整批退回
+  - 解除请求号独立去重，可与异常单号、包裹号及其他业务编号同名：
+    相同解除请求号且异常单、处理说明相同，直接返回首次解除结果与时间，
+    不检查当前状态，不影响后来新建的异常单或后续流转；
+    请求号相同但内容不同报冲突；失败的解除不占用请求号
+
+示例:
+  %s unfreeze --request U1 --incident E1 --note 已核实放行
 `, appName, appName, appName)
 }
