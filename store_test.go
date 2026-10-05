@@ -354,3 +354,256 @@ func TestWhitespaceIDsAreDataNotAcceptedByCaller(t *testing.T) {
 		t.Fatalf("纯空白应报错，得到 %v", err)
 	}
 }
+
+func mustHandoff(t *testing.T, s *Store, req, from, to string, parcels []string, now time.Time) {
+	t.Helper()
+	if _, _, err := s.Handoff(req, from, to, parcels, now); err != nil {
+		t.Fatalf("Handoff(%q) 意外失败: %v", req, err)
+	}
+}
+
+func TestReturnSuccess(t *testing.T) {
+	s, _ := openTempStore(t)
+	t1 := tClock(2026, 10, 5, 9, 0)
+	mustRegister(t, s, "P001", "站点A", t1)
+	mustRegister(t, s, "P002", "站点A", t1)
+	mustHandoff(t, s, "R1", "站点A", "站点B", []string{"P001", "P002"}, tClock(2026, 10, 5, 10, 0))
+
+	t3 := tClock(2026, 10, 5, 11, 0)
+	res, replayed, err := s.Return("RT1", "R1", "错发召回", t3)
+	if err != nil || replayed {
+		t.Fatalf("退回应成功且非重放: %v replayed=%v", err, replayed)
+	}
+	if res.Request != "RT1" || res.Handoff != "R1" || res.From != "站点B" || res.To != "站点A" ||
+		res.Reason != "错发召回" || len(res.Parcels) != 2 || res.Parcels[0] != "P001" || res.Parcels[1] != "P002" {
+		t.Fatalf("退回结果不符: %+v", res)
+	}
+	for _, id := range []string{"P001", "P002"} {
+		p, _ := s.Query(id)
+		if p.Station != "站点A" || p.Status != statusInStation {
+			t.Fatalf("%s 退回后应回到站点A且在站: %+v", id, p)
+		}
+		if len(p.Trail) != 3 {
+			t.Fatalf("%s 应有三条轨迹，得到 %d", id, len(p.Trail))
+		}
+		if e := p.Trail[0]; e.Op != "收件" || e.Station != "站点A" {
+			t.Fatalf("%s 原收件记录不得改写: %+v", id, e)
+		}
+		if e := p.Trail[1]; e.Op != "交接" || e.Request != "R1" || e.Station != "站点B" {
+			t.Fatalf("%s 原交接记录不得改写: %+v", id, e)
+		}
+		e := p.Trail[2]
+		if e.Op != "退回" || e.Station != "站点A" || e.From != "站点B" ||
+			e.Request != "RT1" || e.ReturnOf != "R1" || e.Reason != "错发召回" || !e.Time.Equal(t3) {
+			t.Fatalf("%s 退回记录不符: %+v", id, e)
+		}
+	}
+}
+
+func TestReturnValidationFailures(t *testing.T) {
+	newStore := func(t *testing.T) *Store {
+		s, _ := openTempStore(t)
+		t1 := tClock(2026, 10, 5, 9, 0)
+		mustRegister(t, s, "P001", "站点A", t1)
+		mustRegister(t, s, "P002", "站点A", t1)
+		mustHandoff(t, s, "R1", "站点A", "站点B", []string{"P001", "P002"}, tClock(2026, 10, 5, 10, 0))
+		return s
+	}
+	t3 := tClock(2026, 10, 5, 11, 0)
+
+	t.Run("原交接不存在", func(t *testing.T) {
+		s := newStore(t)
+		if _, _, err := s.Return("RT1", "NOPE", "原因", t3); err == nil {
+			t.Fatal("原交接不存在必须整批拒绝")
+		}
+	})
+
+	t.Run("包裹已离开目的站", func(t *testing.T) {
+		s := newStore(t)
+		mustHandoff(t, s, "R2", "站点B", "站点C", []string{"P001"}, tClock(2026, 10, 5, 10, 30))
+		if _, _, err := s.Return("RT1", "R1", "原因", t3); err == nil {
+			t.Fatal("包裹已离开目的站必须整批拒绝")
+		}
+		// 整批拒绝：P002 仍在站点B 但不得被退回，P001 保持站点C。
+		p1, _ := s.Query("P001")
+		p2, _ := s.Query("P002")
+		if p1.Station != "站点C" || len(p1.Trail) != 3 {
+			t.Fatalf("失败退回不得改动 P001: %+v", p1)
+		}
+		if p2.Station != "站点B" || len(p2.Trail) != 2 {
+			t.Fatalf("失败退回不得改动 P002: %+v", p2)
+		}
+	})
+
+	t.Run("包裹经其他交接回到同一站点仍不可退回旧交接", func(t *testing.T) {
+		s := newStore(t)
+		mustHandoff(t, s, "R2", "站点B", "站点C", []string{"P001"}, tClock(2026, 10, 5, 10, 30))
+		mustHandoff(t, s, "R3", "站点C", "站点B", []string{"P001"}, tClock(2026, 10, 5, 10, 45))
+		// P001 又回到站点B，但最后一条流转不是 R1。
+		if _, _, err := s.Return("RT1", "R1", "原因", t3); err == nil {
+			t.Fatal("最后一条流转不是原交接时必须整批拒绝")
+		}
+	})
+
+	t.Run("已退回的原交接不能换号再次退回", func(t *testing.T) {
+		s := newStore(t)
+		if _, _, err := s.Return("RT1", "R1", "原因", t3); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.Return("RT2", "R1", "原因", t3); err == nil {
+			t.Fatal("同一原交接只能成功退回一次")
+		}
+	})
+}
+
+func TestReturnReplayAndConflict(t *testing.T) {
+	s, _ := openTempStore(t)
+	t1 := tClock(2026, 10, 5, 9, 0)
+	mustRegister(t, s, "P001", "站点A", t1)
+	mustHandoff(t, s, "R1", "站点A", "站点B", []string{"P001"}, tClock(2026, 10, 5, 10, 0))
+
+	first, replayed, err := s.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 11, 0))
+	if err != nil || replayed {
+		t.Fatalf("首次退回应成功: %v replayed=%v", err, replayed)
+	}
+
+	// 同退回请求号、同原交接、同原因：重放首次结果，不追加轨迹。
+	again, replayed, err := s.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 12, 0))
+	if err != nil || !replayed || again != first {
+		t.Fatalf("同内容重复退回应重放: err=%v replayed=%v", err, replayed)
+	}
+	if p, _ := s.Query("P001"); len(p.Trail) != 3 {
+		t.Fatalf("重放不得追加轨迹，P001 有 %d 条", len(p.Trail))
+	}
+
+	// 即使包裹之后又被交接，重放仍返回首次结果、不再移动包裹。
+	mustHandoff(t, s, "R2", "站点A", "站点C", []string{"P001"}, tClock(2026, 10, 5, 13, 0))
+	replay, replayed, err := s.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 14, 0))
+	if err != nil || !replayed || replay != first {
+		t.Fatalf("包裹再交接后重放仍须返回首次结果: err=%v replayed=%v", err, replayed)
+	}
+	if p, _ := s.Query("P001"); p.Station != "站点C" || len(p.Trail) != 4 {
+		t.Fatalf("重放不得改变当前站点或追加轨迹: %+v", p)
+	}
+
+	// 同退回请求号换原交接或原因：冲突。
+	if _, _, err := s.Return("RT1", "R2", "错发召回", tClock(2026, 10, 5, 15, 0)); err == nil {
+		t.Fatal("换原交接必须报冲突")
+	}
+	if _, _, err := s.Return("RT1", "R1", "别的原因", tClock(2026, 10, 5, 15, 0)); err == nil {
+		t.Fatal("换原因必须报冲突")
+	}
+	if saved := s.data.Returns["RT1"]; saved != first {
+		t.Fatal("冲突提交不得改动已有退回结果")
+	}
+
+	// 退回请求号与交接请求号允许同名（独立去重范围）。
+	mustRegister(t, s, "P002", "站点A", t1)
+	mustHandoff(t, s, "R9", "站点A", "站点B", []string{"P002"}, tClock(2026, 10, 5, 16, 0))
+	if _, _, err := s.Return("R9", "R9", "同名允许", tClock(2026, 10, 5, 17, 0)); err != nil {
+		t.Fatalf("退回请求号与交接请求号同名应允许: %v", err)
+	}
+}
+
+func TestFailedReturnDoesNotOccupyRequest(t *testing.T) {
+	s, _ := openTempStore(t)
+	t1 := tClock(2026, 10, 5, 9, 0)
+	mustRegister(t, s, "P001", "站点A", t1)
+	mustHandoff(t, s, "R1", "站点A", "站点B", []string{"P001"}, tClock(2026, 10, 5, 10, 0))
+
+	// 首次退回失败（原交接不存在）。
+	if _, _, err := s.Return("RT1", "NOPE", "原因", tClock(2026, 10, 5, 11, 0)); err == nil {
+		t.Fatal("首次退回应失败")
+	}
+	// 纠正后用同一退回请求号重试，应当成功。
+	res, replayed, err := s.Return("RT1", "R1", "原因", tClock(2026, 10, 5, 12, 0))
+	if err != nil || replayed {
+		t.Fatalf("纠正后重试应作为新退回成功: %v replayed=%v", err, replayed)
+	}
+	if res.Handoff != "R1" {
+		t.Fatalf("重试结果不符: %+v", res)
+	}
+}
+
+func TestReturnPersistenceAcrossRestart(t *testing.T) {
+	_, path := openTempStore(t)
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s1, "P001", "站点A", tClock(2026, 10, 5, 9, 0))
+	mustHandoff(t, s1, "R1", "站点A", "站点B", []string{"P001"}, tClock(2026, 10, 5, 10, 0))
+	if _, _, err := s1.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 11, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("重新打开失败: %v", err)
+	}
+	p, err := s2.Query("P001")
+	if err != nil || p.Station != "站点A" || len(p.Trail) != 3 || p.Trail[2].Op != "退回" {
+		t.Fatalf("重启后退回结果不符: %+v err=%v", p, err)
+	}
+	// 退回去重仍成立。
+	if _, replayed, err := s2.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 12, 0)); err != nil || !replayed {
+		t.Fatalf("重启后重复退回应重放: %v replayed=%v", err, replayed)
+	}
+	// 原交接已退回事实仍成立。
+	if _, _, err := s2.Return("RT2", "R1", "再次退回", tClock(2026, 10, 5, 12, 0)); err == nil {
+		t.Fatal("重启后同一原交接仍不得再次退回")
+	}
+	// 原 handoff 请求同内容重放仍返回首次交接结果，不重新移动包裹。
+	got, replayed, err := s2.Handoff("R1", "站点A", "站点B", []string{"P001"}, tClock(2026, 10, 5, 13, 0))
+	if err != nil || !replayed || got.To != "站点B" {
+		t.Fatalf("重启后原交接重放不符: %v replayed=%v", err, replayed)
+	}
+	if p, _ := s2.Query("P001"); p.Station != "站点A" || len(p.Trail) != 3 {
+		t.Fatalf("原交接重放不得重新移动包裹: %+v", p)
+	}
+}
+
+func TestCorruptReturnDataRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.json")
+	base := `"parcels":{"P001":{"id":"P001","station":"站点A","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"op":"收件","station":"站点A","time":"2026-10-05T09:00:00Z"}]}}`
+	cases := map[string]string{
+		"轨迹缺少操作":      `{"version":1,"parcels":{"P001":{"id":"P001","station":"站点A","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"station":"站点A","time":"2026-10-05T09:00:00Z"}]}},"handoffs":{},"returns":{}}`,
+		"轨迹缺少站点":      `{"version":1,"parcels":{"P001":{"id":"P001","station":"站点A","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"op":"收件","time":"2026-10-05T09:00:00Z"}]}},"handoffs":{},"returns":{}}`,
+		"轨迹缺少时间":      `{"version":1,"parcels":{"P001":{"id":"P001","station":"站点A","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"op":"收件","station":"站点A"}]}},"handoffs":{},"returns":{}}`,
+		"退回引用不存在交接":   `{"version":1,` + base + `,"handoffs":{},"returns":{"RT1":{"request":"RT1","handoff":"R9","from":"B","to":"A","reason":"x","parcels":["P001"],"time":"2026-10-05T10:00:00Z"}}}`,
+		"轨迹退回引用不存在交接": `{"version":1,"parcels":{"P001":{"id":"P001","station":"站点A","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"op":"收件","station":"站点A","time":"2026-10-05T09:00:00Z"},{"op":"退回","station":"站点A","from":"站点B","request":"RT1","reason":"x","returnOf":"R9","time":"2026-10-05T10:00:00Z"}]}},"handoffs":{},"returns":{}}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("应返回 ErrCorrupt，得到 %v", err)
+			}
+			got, _ := os.ReadFile(path)
+			if string(got) != content {
+				t.Fatal("损坏文件不得被覆盖")
+			}
+		})
+	}
+}
+
+func TestOldLedgerWithoutReturnsStillWorks(t *testing.T) {
+	// 旧版台账没有 returns 字段：无需手工修改即可打开并继续退回。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.json")
+	content := `{"version":1,"parcels":{"P001":{"id":"P001","station":"站点B","status":"在站","registered":"2026-10-05T09:00:00Z","trail":[{"op":"收件","station":"站点A","time":"2026-10-05T09:00:00Z"},{"op":"交接","station":"站点B","time":"2026-10-05T10:00:00Z","request":"R1"}]}},"handoffs":{"R1":{"request":"R1","from":"站点A","to":"站点B","parcels":["P001"],"time":"2026-10-05T10:00:00Z"}}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("旧版台账应可直接打开: %v", err)
+	}
+	res, _, err := s.Return("RT1", "R1", "错发召回", tClock(2026, 10, 5, 11, 0))
+	if err != nil || res.To != "站点A" {
+		t.Fatalf("旧版台账应可直接退回: %v %+v", err, res)
+	}
+}
