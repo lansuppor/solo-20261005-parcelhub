@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -413,6 +416,137 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "原因: %s\n", res.Reason)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+// receiptFileRecord 是回执整批导入文件中的单条记录（JSON）。
+type receiptFileRecord struct {
+	Request string `json:"request"`
+	Batch   string `json:"batch"`
+	Parcel  string `json:"parcel"`
+	Result  string `json:"result"`
+	Reason  string `json:"reason"`
+}
+
+// loadReceiptImportFile 读取并解析回执整批导入文件。文件为有序且非空的
+// JSON 数组，元素为 request/batch/parcel/result/reason 字段的对象；
+// 文件只读，绝不改写。任一记录清洗后不合法或请求号在文件内重复，
+// 都返回带记录位置的错误，整份不予导入。
+func loadReceiptImportFile(path string) ([]ReceiptImportRecord, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取回执导入文件失败: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var records []receiptFileRecord
+	if err := dec.Decode(&records); err != nil {
+		return nil, fmt.Errorf("解析回执导入文件失败: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("解析回执导入文件失败: 回执列表之后存在多余内容")
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("回执导入文件必须是有序且非空的回执列表")
+	}
+
+	clean := make([]ReceiptImportRecord, 0, len(records))
+	seen := make(map[string]bool, len(records))
+	for i, rawRec := range records {
+		rec, err := cleanReceiptImportRecord(rawRec)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 条记录: %w", i+1, err)
+		}
+		if seen[rec.Request] {
+			return nil, fmt.Errorf("第 %d 条记录: 回执请求号 %q 在文件内重复", i+1, rec.Request)
+		}
+		seen[rec.Request] = true
+		clean = append(clean, rec)
+	}
+	return clean, nil
+}
+
+// cleanReceiptImportRecord 清洗并校验一条导入记录：各标识去除两端空白后不可为空；
+// 结果为失败时必须给出清理后非空的原因，签收时不可带原因。
+func cleanReceiptImportRecord(raw receiptFileRecord) (ReceiptImportRecord, error) {
+	var rec ReceiptImportRecord
+	var err error
+	if rec.Request, err = cleanID("回执请求号", raw.Request); err != nil {
+		return rec, err
+	}
+	if rec.Batch, err = cleanID("批次号", raw.Batch); err != nil {
+		return rec, err
+	}
+	if rec.Parcel, err = cleanID("包裹编号", raw.Parcel); err != nil {
+		return rec, err
+	}
+	if rec.Result, err = cleanID("回执结果", raw.Result); err != nil {
+		return rec, err
+	}
+	if rec.Result != resultSigned && rec.Result != resultFailed {
+		return rec, fmt.Errorf("回执结果只能是 %q 或 %q，得到 %q", resultSigned, resultFailed, rec.Result)
+	}
+	rec.Reason = strings.TrimSpace(raw.Reason)
+	if rec.Result == resultFailed && rec.Reason == "" {
+		return rec, fmt.Errorf("结果为失败时原因不可为空或仅含空白")
+	}
+	if rec.Result == resultSigned && rec.Reason != "" {
+		return rec, fmt.Errorf("结果为签收时不可带原因")
+	}
+	return rec, nil
+}
+
+func cmdReceiptImport(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("receipt-import", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	file := fs.String("file", "", "回执导入文件路径（JSON 数组，只读，不会被修改）")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiptImportHelp); !ok {
+		return code
+	}
+
+	if strings.TrimSpace(*file) == "" {
+		fmt.Fprintf(stderr, "%s receipt-import: 选项 --file 需要一个非空的回执导入文件路径\n", appName)
+		return exitBusiness
+	}
+
+	// 输入文件只读；读取、解析或清洗失败时整份不予导入。
+	records, err := loadReceiptImportFile(*file)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
+		return exitBusiness
+	}
+	items, err := store.ImportReceipts(records, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	replayed := 0
+	for _, it := range items {
+		if it.Replayed {
+			replayed++
+		}
+	}
+	fmt.Fprintf(stdout, "回执导入成功（共 %d 条：新增 %d 条，重放 %d 条）\n", len(items), len(items)-replayed, replayed)
+	for i, it := range items {
+		mark := "新增"
+		if it.Replayed {
+			mark = "重放（返回首次保存的结果）"
+		}
+		line := fmt.Sprintf("  %d. 请求号: %s    批次号: %s    包裹编号: %s    结果: %s",
+			i+1, it.Record.Request, it.Record.Batch, it.Record.Parcel, it.Record.Result)
+		if it.Record.Result == resultFailed {
+			line += fmt.Sprintf("    原因: %s", it.Record.Reason)
+		}
+		fmt.Fprintf(stdout, "%s    标记: %s    时间: %s\n", line, mark, it.Time.Format(timeFmt))
+	}
 	return exitOK
 }
 

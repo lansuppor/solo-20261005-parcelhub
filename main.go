@@ -86,6 +86,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdDispatch(dataFile, rest[1:], stdout, stderr)
 	case "receipt":
 		return cmdReceipt(dataFile, rest[1:], stdout, stderr)
+	case "receipt-import":
+		return cmdReceiptImport(dataFile, rest[1:], stdout, stderr)
 	case "batch":
 		return cmdBatch(dataFile, rest[1:], stdout, stderr)
 	case "freeze":
@@ -125,6 +127,7 @@ func printHelp(w io.Writer) {
   return                 按原交接整批退回，实物送回该交接的源站点
   dispatch               配送批次出站：整批包裹转为“配送中”，批次成员保存后不可修改
   receipt                逐件回执：签收或失败（失败须给原因）；全部回执后批次自动完成
+  receipt-import         从本地文件整批导入回执：全部可接受才整体生效，任一不符整份拒绝
   batch                  按批次号查询成员、配送员、出站时间与逐件回执进度
   freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
@@ -139,13 +142,14 @@ func printHelp(w io.Writer) {
               --parcel P001 --parcel P002
   %s receipt  --request RC1 --batch B1 --parcel P001 --result 签收
   %s receipt  --request RC2 --batch B1 --parcel P002 --result 失败 --reason 收件人不在
+  %s receipt-import --file receipts.json
   %s batch    --id B1
   %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
   %s unfreeze --request U1 --incident E1 --note 已核实放行
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -277,6 +281,39 @@ func printReceiptHelp(w io.Writer) {
   %s receipt --request RC1 --batch B1 --parcel P001 --result 签收
   %s receipt --request RC2 --batch B1 --parcel P002 --result 失败 --reason 收件人不在
 `, appName, appName, appName, appName)
+}
+
+func printReceiptImportHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s receipt-import — 从本地文件整批导入配送回执
+
+用法:
+  %s receipt-import [--data FILE] --file 回执导入文件
+
+文件格式（JSON，有序且非空的数组，按文件顺序处理；文件只读，不会被修改）:
+  [
+    {"request": "RC1", "batch": "B1", "parcel": "P001", "result": "签收"},
+    {"request": "RC2", "batch": "B1", "parcel": "P002", "result": "失败", "reason": "收件人不在"}
+  ]
+
+规则:
+  - 每条记录的请求号、批次号、包裹编号、结果去除两端空白后不可为空；
+    结果为“失败”时必须给出清理后非空的原因，结果为“签收”时不可带原因
+  - 文件内请求号清理后不可重复；文件路径或文件名不作为去重身份，
+    相同内容换文件或重排记录不会再次生效
+  - 与逐件 receipt 共用同一回执请求号去重范围（与其他业务编号独立）：
+    同请求号且批次、包裹、结果、清理后的原因相同的记录返回首次结果与时间，
+    不检查当前状态、不追加轨迹、不改变批次进度；换内容报冲突
+  - 首次回执要求批次存在、包裹属于该批次、尚未在该批次回执，
+    且当前仍在该批次配送中；每件在一个批次只能成功回执一次，
+    同文件换请求号再次回执同一批次同一包裹也会整份拒绝
+  - 整份导入只有全部记录可接受并整体保存后才报告成功，按文件顺序列出
+    各条结果、发生时间及新增或重放标记；任一记录无效、冲突或受理条件
+    不符，整份拒绝并提示记录位置与原因，新请求号均不占用，可纠正后重试；
+    全部为历史重放时不改写台账
+
+示例:
+  %s receipt-import --file receipts.json
+`, appName, appName, appName)
 }
 
 func printBatchHelp(w io.Writer) {

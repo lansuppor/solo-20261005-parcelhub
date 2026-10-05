@@ -736,17 +736,32 @@ func (s *Store) Dispatch(batch, station, courier string, parcels []string, now t
 // 回执请求号与批次号、包裹编号、交接及退回请求号分属独立去重范围，允许同名；
 // 失败的首次回执不占用请求号。
 func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.Time) (res *ReceiptResult, replayed bool, err error) {
+	res, replayed, undo, err := s.applyReceipt(request, batch, parcel, result, reason, now)
+	if err != nil || replayed {
+		return res, replayed, err
+	}
+	if err := s.save(); err != nil {
+		undo() // 落盘失败：回滚内存变更，保留原有有效数据
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// applyReceipt 在内存台账上校验并应用一条回执（不落盘），是 Receipt 与
+// ImportReceipts 共用的核心。全部校验通过后才会改动数据；返回的 undo 可在
+// 整体保存失败时撤销本次改动（重放或校验失败时 undo 为 nil）。
+func (s *Store) applyReceipt(request, batch, parcel, result, reason string, now time.Time) (res *ReceiptResult, replayed bool, undo func(), err error) {
 	if saved, ok := s.data.Receipts[request]; ok {
 		if saved.Batch == batch && saved.Parcel == parcel && saved.Result == result && saved.Reason == reason {
-			return saved, true, nil
+			return saved, true, nil, nil
 		}
-		return nil, false, fmt.Errorf("回执请求号 %q 已用于一次不同的回执（批次=%q 包裹=%q 结果=%q），内容冲突",
+		return nil, false, nil, fmt.Errorf("回执请求号 %q 已用于一次不同的回执（批次=%q 包裹=%q 结果=%q），内容冲突",
 			request, saved.Batch, saved.Parcel, saved.Result)
 	}
 
 	b, ok := s.data.Batches[batch]
 	if !ok {
-		return nil, false, fmt.Errorf("回执失败：批次号 %q 不存在", batch)
+		return nil, false, nil, fmt.Errorf("回执失败：批次号 %q 不存在", batch)
 	}
 	member := false
 	for _, id := range b.Parcels {
@@ -756,14 +771,14 @@ func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.
 		}
 	}
 	if !member {
-		return nil, false, fmt.Errorf("回执失败：包裹 %q 不属于批次 %q", parcel, batch)
+		return nil, false, nil, fmt.Errorf("回执失败：包裹 %q 不属于批次 %q", parcel, batch)
 	}
 	if _, done := b.Receipts[parcel]; done {
-		return nil, false, fmt.Errorf("回执失败：包裹 %q 在批次 %q 中已回执，每件在一个批次只能成功回执一次", parcel, batch)
+		return nil, false, nil, fmt.Errorf("回执失败：包裹 %q 在批次 %q 中已回执，每件在一个批次只能成功回执一次", parcel, batch)
 	}
 	p := s.data.Parcels[parcel] // 批次成员必已登记（载入校验保证）
 	if p.Status != statusDelivering || currentBatch(p) != batch {
-		return nil, false, fmt.Errorf("回执失败：包裹 %q 当前状态为 %q，不在批次 %q 配送中", parcel, p.Status, batch)
+		return nil, false, nil, fmt.Errorf("回执失败：包裹 %q 当前状态为 %q，不在批次 %q 配送中", parcel, p.Status, batch)
 	}
 
 	res = &ReceiptResult{
@@ -776,9 +791,9 @@ func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.
 	}
 	entry := &ReceiptEntry{Request: request, Result: result, Reason: reason, Time: now}
 
-	// 记录旧值，落盘失败时整体回滚。
+	// 记录旧值，undo 在整体落盘失败时回滚。
 	oldStatus, oldStation := p.Status, p.Station
-	oldTrail := append([]Event(nil), p.Trail...)
+	oldTrailLen := len(p.Trail)
 
 	if result == resultSigned {
 		p.Status = statusSigned // 站点保留不变
@@ -798,13 +813,83 @@ func (s *Store) Receipt(request, batch, parcel, result, reason string, now time.
 	b.Receipts[parcel] = entry
 	s.data.Receipts[request] = res
 
-	if err := s.save(); err != nil {
+	undo = func() {
 		delete(s.data.Receipts, request)
 		delete(b.Receipts, parcel)
-		p.Status, p.Station, p.Trail = oldStatus, oldStation, oldTrail
-		return nil, false, err
+		p.Status, p.Station = oldStatus, oldStation
+		p.Trail = p.Trail[:oldTrailLen]
 	}
-	return res, false, nil
+	return res, false, undo, nil
+}
+
+// ReceiptImportRecord 是回执整批导入文件中的一条记录（已清洗）。
+type ReceiptImportRecord struct {
+	Request string // 回执请求号（与逐件 receipt 共用去重范围）
+	Batch   string // 配送批次号
+	Parcel  string // 包裹编号
+	Result  string // 签收 | 失败
+	Reason  string // 失败原因（失败时非空，签收时为空）
+}
+
+// ReceiptImportItem 是整批导入中一条记录的处理结果，按文件顺序排列。
+type ReceiptImportItem struct {
+	Record   ReceiptImportRecord // 清洗后的记录内容
+	Time     time.Time           // 发生时间（重放时为首次保存的时间）
+	Replayed bool                // true 表示同内容历史重放，未产生新变更
+}
+
+// ImportReceipts 按文件顺序整批应用回执记录。
+//
+// 逐条处理：与逐件 Receipt 共用同一回执请求号去重范围，同请求号且批次、包裹、
+// 结果、清理后的原因相同的记录返回首次结果与时间（重放），不检查当前状态、不追加
+// 轨迹、不改变批次进度；换内容报冲突。首次回执要求批次存在、包裹属于该批次、
+// 尚未在该批次回执且当前仍在该批次配送中（含本文件前面记录已产生的回执）。
+// 全部记录可接受时作为一个整体原子落盘；任一记录无效、冲突或受理条件不符，
+// 整份拒绝并提示记录位置，台账保持导入前状态，新请求号均不占用。
+// 全部为历史重放时不改写台账。
+func (s *Store) ImportReceipts(records []ReceiptImportRecord, now time.Time) ([]ReceiptImportItem, error) {
+	// 在台账副本上按文件顺序试算：任一记录失败直接放弃副本，原台账保持不变。
+	work, err := s.fork()
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ReceiptImportItem, 0, len(records))
+	hasNew := false
+	for i, rec := range records {
+		res, replayed, _, err := work.applyReceipt(rec.Request, rec.Batch, rec.Parcel, rec.Result, rec.Reason, now)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 条记录（请求号 %q）：%w", i+1, rec.Request, err)
+		}
+		if !replayed {
+			hasNew = true
+		}
+		items = append(items, ReceiptImportItem{Record: rec, Time: res.Time, Replayed: replayed})
+	}
+	if !hasNew {
+		return items, nil // 全部为历史重放：不改写台账
+	}
+
+	// 整体提交：副本替换当前台账后一次原子落盘，失败时恢复导入前状态。
+	orig := s.data
+	s.data = work.data
+	if err := s.save(); err != nil {
+		s.data = orig
+		return nil, err
+	}
+	return items, nil
+}
+
+// fork 返回当前台账的深拷贝副本，供整批导入试算；副本上的任何改动都不影响原台账。
+func (s *Store) fork() (*Store, error) {
+	buf, err := json.Marshal(s.data)
+	if err != nil {
+		return nil, fmt.Errorf("准备回执整批导入失败: %w", err)
+	}
+	var cp ledgerFile
+	if err := json.Unmarshal(buf, &cp); err != nil {
+		return nil, fmt.Errorf("准备回执整批导入失败: %w", err)
+	}
+	return &Store{path: s.path, data: cp}, nil
 }
 
 // Freeze 对一件在站包裹登记异常冻结。
