@@ -443,8 +443,8 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹缺少运输单号、源站或目的站", ErrCorrupt, id, i+1)
 				}
 				sh, ok := l.Shipments[e.Shipment]
-				if !ok {
-					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹引用了不存在的运输单 %q", ErrCorrupt, id, i+1, e.Shipment)
+				if !ok || sh == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹引用了不存在或为空的运输单 %q", ErrCorrupt, id, i+1, e.Shipment)
 				}
 				if sh.From != e.From || sh.To != e.To || e.Station != e.From || !sh.Time.Equal(e.Time) {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹与运输单 %q 记录不一致", ErrCorrupt, id, i+1, e.Shipment)
@@ -465,11 +465,19 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹缺少运输单号、接收请求号、源站或目的站", ErrCorrupt, id, i+1)
 				}
 				rv, ok := l.Receives[e.Request]
-				if !ok {
-					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用了不存在的接收请求 %q", ErrCorrupt, id, i+1, e.Request)
+				if !ok || rv == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用了不存在或为空的接收请求 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 				if rv.Shipment != e.Shipment || rv.Station != e.Station || e.Station != e.To || !rv.Time.Equal(e.Time) {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹与接收请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				sh, ok := l.Shipments[rv.Shipment]
+				if !ok || sh == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用的运输单 %q 不存在或为空", ErrCorrupt, id, i+1, rv.Shipment)
+				}
+				if sh.From != e.From || sh.To != e.To {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹的两站（%q→%q）与运输单 %q 的两站（%q→%q）不一致",
+						ErrCorrupt, id, i+1, e.From, e.To, rv.Shipment, sh.From, sh.To)
 				}
 				inReceive := false
 				for _, pid := range rv.Parcels {
@@ -804,7 +812,7 @@ func (l *ledgerFile) validate() error {
 		}
 		if sh.ReceivedBy != "" {
 			r, ok := l.Receives[sh.ReceivedBy]
-			if !ok || r.Shipment != no {
+			if !ok || r == nil || r.Shipment != no {
 				return fmt.Errorf("%w: 运输单 %q 标记的接收请求号 %q 无法对应", ErrCorrupt, no, sh.ReceivedBy)
 			}
 			continue
@@ -831,7 +839,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 接收请求号 %q 的接收结果不完整", ErrCorrupt, req)
 		}
 		sh, ok := l.Shipments[r.Shipment]
-		if !ok {
+		if !ok || sh == nil {
 			return fmt.Errorf("%w: 接收请求号 %q 引用了不存在的运输单 %q", ErrCorrupt, req, r.Shipment)
 		}
 		if sh.ReceivedBy != req {
@@ -857,6 +865,68 @@ func (l *ledgerFile) validate() error {
 			}
 			if !found {
 				return fmt.Errorf("%w: 接收请求号 %q 的成员包裹 %q 缺少对应的接收轨迹", ErrCorrupt, req, pid)
+			}
+		}
+	}
+	// 运输生命周期：按每件包裹轨迹的保存顺序（不按时间）核对发运与接收的配对。
+	// 每张运输单的成员恰有一次对应发运；已接收时恰有一次对应接收且位于发运之后；
+	// 发运后到接收前不得出现其他作业轨迹；未接收时不得有接收记录，发运必须是
+	// 最后一条轨迹；接收后没有后续作业时，成员必须在目的站在站。接收之后的合法
+	// 交接、再次发运、配送回执及其撤销、中止、续接、冻结和解除照常受理，不因
+	// 历史接收而把成员永远固定在目的站。
+	for id, p := range l.Parcels {
+		shipped := make(map[string]bool)  // 该包裹轨迹中出现过的发运运输单号
+		received := make(map[string]bool) // 该包裹轨迹中出现过的接收请求号
+		var open string                   // 按轨迹顺序推导的当前未接收运输单号
+		for i, e := range p.Trail {
+			switch e.Op {
+			case "发运":
+				if open != "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运时运输单 %q 尚未接收，发运后到接收前不得出现其他作业轨迹",
+						ErrCorrupt, id, i+1, open)
+				}
+				if shipped[e.Shipment] {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运与运输单 %q 的首次发运重复，每张运输单的成员恰有一次对应发运",
+						ErrCorrupt, id, i+1, e.Shipment)
+				}
+				shipped[e.Shipment] = true
+				open = e.Shipment
+			case "接收":
+				if open == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收之前没有对应的发运轨迹", ErrCorrupt, id, i+1)
+				}
+				if open != e.Shipment {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收的运输单 %q 与当前在途的运输单 %q 不一致",
+						ErrCorrupt, id, i+1, e.Shipment, open)
+				}
+				if received[e.Request] {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收与接收请求 %q 的首次接收重复，每次接收恰有一条对应轨迹",
+						ErrCorrupt, id, i+1, e.Request)
+				}
+				received[e.Request] = true
+				open = ""
+			default:
+				if open != "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条轨迹（%s）出现在运输单 %q 发运之后、接收之前，在途期间不得出现其他作业轨迹",
+						ErrCorrupt, id, i+1, e.Op, open)
+				}
+			}
+		}
+		if open != "" {
+			// 轨迹止于发运：该运输单必须尚未接收（已接收却缺少接收轨迹即损坏），
+			// 此时发运必为最后一条轨迹（其后任何轨迹都会在上面被拒绝）。
+			sh := l.Shipments[open] // 发运轨迹校验已保证运输单存在且非空
+			if sh.ReceivedBy != "" {
+				return fmt.Errorf("%w: 运输单 %q 已接收（接收请求号 %q），但成员包裹 %q 缺少对应的接收轨迹",
+					ErrCorrupt, open, sh.ReceivedBy, id)
+			}
+		}
+		// 接收后没有后续作业时，成员必须在目的站在站；有后续作业时当前站点、
+		// 状态与运输归属由那些记录各自的校验负责。
+		if last := p.Trail[len(p.Trail)-1]; last.Op == "接收" {
+			if p.Station != last.To || p.Status != statusInStation {
+				return fmt.Errorf("%w: 包裹 %q 最后一条轨迹为运输单 %q 的接收，但当前归属 %q、状态 %q，不在目的站 %q 在站",
+					ErrCorrupt, id, last.Shipment, p.Station, p.Status, last.To)
 			}
 		}
 	}
