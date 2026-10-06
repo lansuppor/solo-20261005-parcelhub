@@ -111,7 +111,7 @@ func TestImportReceiptsAtomicRejection(t *testing.T) {
 		{"同文件换请求号重复回执同批次同包裹", []ReceiptImportRecord{
 			{Request: "RC1", Batch: "B1", Parcel: "P001", Result: resultSigned},
 			{Request: "RC2", Batch: "B1", Parcel: "P001", Result: resultFailed, Reason: "破损"},
-		}, "只能成功回执一次"},
+		}, "只能有一条未撤销回执"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
