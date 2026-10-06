@@ -20,7 +20,7 @@ func mustShip(t *testing.T, s *Store, shipment, from, to string, parcels []strin
 
 func mustReceive(t *testing.T, s *Store, request, shipment, station string, now time.Time) *ReceiveResult {
 	t.Helper()
-	res, replayed, err := s.Receive(request, shipment, station, now)
+	res, replayed, err := s.Receive(request, shipment, station, nil, now)
 	if err != nil || replayed {
 		t.Fatalf("Receive(%q) 意外失败: %v replayed=%v", request, err, replayed)
 	}
@@ -237,7 +237,7 @@ func TestReceiveReplayAndConflict(t *testing.T) {
 
 	// 接收后包裹再流转，同号同内容重放仍返回首次接收结果与时间。
 	mustHandoff(t, s, "R9", "站点B", "站点C", []string{"P001"}, tClock(2026, 10, 5, 13, 0))
-	res, replayed, err := s.Receive("RS1", "S1", "站点B", tClock(2026, 10, 5, 14, 0))
+	res, replayed, err := s.Receive("RS1", "S1", "站点B", nil, tClock(2026, 10, 5, 14, 0))
 	if err != nil || !replayed {
 		t.Fatalf("同内容重放应返回首次结果: %v replayed=%v", err, replayed)
 	}
@@ -255,17 +255,17 @@ func TestReceiveReplayAndConflict(t *testing.T) {
 
 	// 换内容冲突：换运输单或换接收站点均拒绝。
 	mustShip(t, s, "S2", "站点B", "站点C", []string{"P002"}, tClock(2026, 10, 5, 14, 30))
-	if _, _, err := s.Receive("RS1", "S2", "站点C", tClock(2026, 10, 5, 15, 0)); err == nil ||
+	if _, _, err := s.Receive("RS1", "S2", "站点C", nil, tClock(2026, 10, 5, 15, 0)); err == nil ||
 		!strings.Contains(err.Error(), "冲突") {
 		t.Fatalf("换运输单应报冲突: %v", err)
 	}
-	if _, _, err := s.Receive("RS1", "S1", "站点C", tClock(2026, 10, 5, 15, 0)); err == nil ||
+	if _, _, err := s.Receive("RS1", "S1", "站点C", nil, tClock(2026, 10, 5, 15, 0)); err == nil ||
 		!strings.Contains(err.Error(), "冲突") {
 		t.Fatalf("换接收站点应报冲突: %v", err)
 	}
 
 	// 换请求号再次接收同一运输单拒绝。
-	if _, _, err := s.Receive("RS2", "S1", "站点B", tClock(2026, 10, 5, 15, 0)); err == nil {
+	if _, _, err := s.Receive("RS2", "S1", "站点B", nil, tClock(2026, 10, 5, 15, 0)); err == nil {
 		t.Fatalf("换请求号再次接收同一运输单应拒绝")
 	}
 
@@ -279,11 +279,11 @@ func TestReceiveFailuresAtomic(t *testing.T) {
 	mustShip(t, s, "S1", "站点A", "站点B", []string{"P001", "P002"}, tClock(2026, 10, 5, 10, 0))
 
 	// 运输单不存在。
-	if _, _, err := s.Receive("RS1", "S404", "站点B", tClock(2026, 10, 5, 11, 0)); err == nil {
+	if _, _, err := s.Receive("RS1", "S404", "站点B", nil, tClock(2026, 10, 5, 11, 0)); err == nil {
 		t.Fatalf("接收不存在的运输单应拒绝")
 	}
 	// 接收站点不是目的站。
-	if _, _, err := s.Receive("RS1", "S1", "站点C", tClock(2026, 10, 5, 11, 0)); err == nil {
+	if _, _, err := s.Receive("RS1", "S1", "站点C", nil, tClock(2026, 10, 5, 11, 0)); err == nil {
 		t.Fatalf("接收站点不符应整单拒绝")
 	}
 	// 失败的首次接收不占用请求号，运输单仍未接收，包裹仍在途。
@@ -344,10 +344,10 @@ func TestShipReceivePersistence(t *testing.T) {
 	if _, replayed, err := s2.Ship("S1", "站点A", "站点B", []string{"P002", "P001"}, tClock(2026, 10, 5, 14, 0)); err != nil || !replayed {
 		t.Fatalf("重开后发运重放应返回首次结果: %v replayed=%v", err, replayed)
 	}
-	if _, replayed, err := s2.Receive("RS1", "S1", "站点B", tClock(2026, 10, 5, 14, 0)); err != nil || !replayed {
+	if _, replayed, err := s2.Receive("RS1", "S1", "站点B", nil, tClock(2026, 10, 5, 14, 0)); err != nil || !replayed {
 		t.Fatalf("重开后接收重放应返回首次结果: %v replayed=%v", err, replayed)
 	}
-	if _, _, err := s2.Receive("RS9", "S1", "站点B", tClock(2026, 10, 5, 14, 0)); err == nil {
+	if _, _, err := s2.Receive("RS9", "S1", "站点B", nil, tClock(2026, 10, 5, 14, 0)); err == nil {
 		t.Fatalf("重开后换请求号再次接收同单应拒绝")
 	}
 }

@@ -330,14 +330,14 @@ func TestPostReceiveFlowsAndReplaySurviveReload(t *testing.T) {
 	if err != nil || !replayed || !sameOrder(res1.Parcels, []string{"P001", "P002"}) || !res1.Time.Equal(shipTime) {
 		t.Fatalf("发运重放应返回首次成员顺序与时间: %+v replayed=%v err=%v", res1, replayed, err)
 	}
-	res2, replayed, err := s2.Receive("RS1", "S1", "站点B", tClock(2026, 10, 6, 9, 0))
+	res2, replayed, err := s2.Receive("RS1", "S1", "站点B", nil, tClock(2026, 10, 6, 9, 0))
 	if err != nil || !replayed || !sameOrder(res2.Parcels, []string{"P001", "P002"}) || !res2.Time.Equal(recvTime) {
 		t.Fatalf("接收重放应返回首次成员与时间: %+v replayed=%v err=%v", res2, replayed, err)
 	}
 	if _, replayed, err := s2.Ship("S2", "站点C", "站点D", []string{"P001"}, tClock(2026, 10, 6, 9, 0)); err != nil || !replayed {
 		t.Fatalf("再次发运的重放应返回首次结果: replayed=%v err=%v", replayed, err)
 	}
-	if _, replayed, err := s2.Receive("RS2", "S2", "站点D", tClock(2026, 10, 6, 9, 0)); err != nil || !replayed {
+	if _, replayed, err := s2.Receive("RS2", "S2", "站点D", nil, tClock(2026, 10, 6, 9, 0)); err != nil || !replayed {
 		t.Fatalf("再次接收的重放应返回首次结果: replayed=%v err=%v", replayed, err)
 	}
 	// 接收后运输单号不释放：换内容仍冲突。
@@ -463,7 +463,7 @@ func TestShipReceiveReplayDoesNotRecheckAcceptance(t *testing.T) {
 	if err != nil || !replayed || !res.Time.Equal(shipTime) {
 		t.Fatalf("发运重放不应重新检查首次受理条件: %+v replayed=%v err=%v", res, replayed, err)
 	}
-	rres, replayed, err := s.Receive("RS1", "S1", "站点B", time.Now())
+	rres, replayed, err := s.Receive("RS1", "S1", "站点B", nil, time.Now())
 	if err != nil || !replayed || !rres.Time.Equal(recvTime) {
 		t.Fatalf("接收重放不应重新检查首次受理条件: %+v replayed=%v err=%v", rres, replayed, err)
 	}

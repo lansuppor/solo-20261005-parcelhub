@@ -1018,6 +1018,8 @@ func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	request := fs.String("request", "", "接收请求号（独立去重）")
 	shipment := fs.String("shipment", "", "要接收的运输单号")
 	station := fs.String("station", "", "接收站点（必须等于运输单目的站）")
+	var parcels stringList
+	fs.Var(&parcels, "parcel", "包裹编号，可重复指定；指定后只接收这些未到件，不指定则接收全部尚未接收件")
 	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiveHelp); !ok {
 		return code
 	}
@@ -1037,6 +1039,16 @@ func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
 		return exitBusiness
 	}
+	// 不指定 --parcel 为不选成员方式（接收全部尚未接收件）；指定则为显式集合。
+	var cleanParcels []string
+	if len(parcels) > 0 {
+		var err error
+		cleanParcels, err = cleanParcelList(parcels)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+			return exitBusiness
+		}
+	}
 
 	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
@@ -1044,7 +1056,7 @@ func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 	defer release()
-	result, replayed, err := store.Receive(cleanReq, cleanShipment, cleanStation, now())
+	result, replayed, err := store.Receive(cleanReq, cleanShipment, cleanStation, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
 		return exitBusiness
@@ -1054,7 +1066,7 @@ func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	if replayed {
 		headline = "接收成功（接收请求号重复提交，返回首次保存的结果，未再追加轨迹）"
 	}
-	fmt.Fprintf(stdout, "%s\n接收请求号: %s\n运输单号: %s\n接收站点: %s\n包裹（%d 件）:\n",
+	fmt.Fprintf(stdout, "%s\n接收请求号: %s\n运输单号: %s\n接收站点: %s\n本次接收（%d 件）:\n",
 		headline, result.Request, result.Shipment, result.Station, len(result.Parcels))
 	for _, id := range result.Parcels {
 		fmt.Fprintf(stdout, "  - %s\n", id)
@@ -1088,14 +1100,27 @@ func cmdShipment(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	status := "待接收"
-	if sh.ReceivedBy != "" {
-		status = "已接收"
-	}
-	fmt.Fprintf(stdout, "运输单号: %s\n源站点: %s\n目的站点: %s\n运输单状态: %s\n成员（%d 件）:\n",
-		sh.Shipment, sh.From, sh.To, status, len(sh.Parcels))
+	received := 0
 	for _, pid := range sh.Parcels {
-		fmt.Fprintf(stdout, "  - %s\n", pid)
+		if store.ShipmentReceiveOf(cleanIDVal, pid) != nil {
+			received++
+		}
+	}
+	status := "待接收"
+	if received == len(sh.Parcels) {
+		status = "已接收"
+	} else if received > 0 {
+		status = "部分接收"
+	}
+	fmt.Fprintf(stdout, "运输单号: %s\n源站点: %s\n目的站点: %s\n运输单状态: %s\n接收进度: %d/%d 已接收\n成员（%d 件）:\n",
+		sh.Shipment, sh.From, sh.To, status, received, len(sh.Parcels), len(sh.Parcels))
+	for _, pid := range sh.Parcels {
+		if rv := store.ShipmentReceiveOf(cleanIDVal, pid); rv != nil {
+			fmt.Fprintf(stdout, "  - %s    已接收    接收请求号: %s    接收时间: %s\n",
+				pid, rv.Request, rv.Time.Format(timeFmt))
+		} else {
+			fmt.Fprintf(stdout, "  - %s    待接收（站间在途）\n", pid)
+		}
 	}
 	fmt.Fprintf(stdout, "发运时间: %s\n", sh.Time.Format(timeFmt))
 	if sh.ReceivedBy != "" {
