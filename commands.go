@@ -115,6 +115,9 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	if sh := store.ActiveShipment(cleanIDVal); sh != nil {
+		fmt.Fprintf(stdout, "当前运输单: %s\n目的站: %s\n", sh.Shipment, sh.To)
+	}
 	if f := store.ActiveFreeze(cleanIDVal); f != nil {
 		fmt.Fprintf(stdout, "当前未解除异常: 异常单号: %s    原因: %s    冻结时间: %s\n",
 			f.Incident, f.Reason, f.Time.Format(timeFmt))
@@ -155,6 +158,12 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		case "续接":
 			fmt.Fprintf(stdout, "  %d. 操作: 续接    站点: %s    原批次号: %s    新批次号: %s    新配送员: %s    续接请求号: %s    原因: %s    时间: %s\n",
 				i+1, e.Station, e.FromBatch, e.Batch, e.Courier, e.Request, e.Reason, e.Time.Format(timeFmt))
+		case "发运":
+			fmt.Fprintf(stdout, "  %d. 操作: 发运    源站: %s    目的站: %s    运输单号: %s    时间: %s\n",
+				i+1, e.From, e.To, e.Shipment, e.Time.Format(timeFmt))
+		case "接收":
+			fmt.Fprintf(stdout, "  %d. 操作: 接收    源站: %s    目的站: %s    运输单号: %s    接收请求号: %s    时间: %s\n",
+				i+1, e.From, e.To, e.Shipment, e.Request, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -938,5 +947,161 @@ func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdShip(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("ship", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	shipment := fs.String("shipment", "", "运输单号（独立去重，接收后也不能复用）")
+	from := fs.String("from", "", "源站点")
+	to := fs.String("to", "", "目的站点")
+	var parcels stringList
+	fs.Var(&parcels, "parcel", "包裹编号，可重复指定；集合不可为空或含重复编号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printShipHelp); !ok {
+		return code
+	}
+
+	cleanShipment, err := cleanID("运输单号", *shipment)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanFrom, err := cleanID("源站点", *from)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanTo, err := cleanID("目的站点", *to)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanParcels, err := cleanParcelList(parcels)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+	if cleanFrom == cleanTo {
+		fmt.Fprintf(stderr, "%s ship: 源站点与目的站点不能相同（均为 %q）\n", appName, cleanFrom)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	result, replayed, err := store.Ship(cleanShipment, cleanFrom, cleanTo, cleanParcels, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s ship: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "发运成功"
+	if replayed {
+		headline = "发运成功（运输单号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n运输单号: %s\n源站点: %s\n目的站点: %s\n包裹（%d 件）:\n",
+		headline, result.Shipment, result.From, result.To, len(result.Parcels))
+	for _, id := range result.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", result.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("receive", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "接收请求号（独立去重）")
+	shipment := fs.String("shipment", "", "要接收的运输单号")
+	station := fs.String("station", "", "接收站点（必须等于运输单目的站）")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiveHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("接收请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanShipment, err := cleanID("运输单号", *shipment)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanStation, err := cleanID("接收站点", *station)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	result, replayed, err := store.Receive(cleanReq, cleanShipment, cleanStation, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receive: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "接收成功"
+	if replayed {
+		headline = "接收成功（接收请求号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n接收请求号: %s\n运输单号: %s\n接收站点: %s\n包裹（%d 件）:\n",
+		headline, result.Request, result.Shipment, result.Station, len(result.Parcels))
+	for _, id := range result.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", result.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdShipment(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("shipment", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	id := fs.String("id", "", "要查询的运输单号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printShipmentHelp); !ok {
+		return code
+	}
+
+	cleanIDVal, err := cleanID("运输单号", *id)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s shipment: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s shipment: %v\n", appName, err)
+		return exitBusiness
+	}
+	sh, err := store.ShipmentQuery(cleanIDVal)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s shipment: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	status := "待接收"
+	if sh.ReceivedBy != "" {
+		status = "已接收"
+	}
+	fmt.Fprintf(stdout, "运输单号: %s\n源站点: %s\n目的站点: %s\n运输单状态: %s\n成员（%d 件）:\n",
+		sh.Shipment, sh.From, sh.To, status, len(sh.Parcels))
+	for _, pid := range sh.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", pid)
+	}
+	fmt.Fprintf(stdout, "发运时间: %s\n", sh.Time.Format(timeFmt))
+	if sh.ReceivedBy != "" {
+		rv := store.ReceiveOf(sh.ReceivedBy)
+		fmt.Fprintf(stdout, "接收请求号: %s\n接收站点: %s\n接收时间: %s\n",
+			rv.Request, rv.Station, rv.Time.Format(timeFmt))
+	}
 	return exitOK
 }

@@ -22,6 +22,9 @@ const (
 	statusSigned = "已签收"
 	// statusFrozen 表示在站包裹因异常被冻结：站点不变，禁止交接、配送出站与整批退回。
 	statusFrozen = "异常冻结"
+	// statusInTransit 表示包裹已随某张运输单离开源站、尚未在目的站被接收：
+	// 归属站点暂记源站，禁止交接、退回、配送出站与冻结。
+	statusInTransit = "站间在途"
 )
 
 // 回执结果。
@@ -32,11 +35,13 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执
-	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接/撤销回执为批次出发站）
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执 | 发运 | 接收
+	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接/撤销回执为批次出发站；发运时为源站，接收时为目的站）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接/撤销请求号（收件、出站记录为空）
-	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接/撤销/接收请求号（收件、出站、发运记录为空）
+	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）或发运/接收源站（仅发运、接收记录有）
+	To         string    `json:"to,omitempty"`         // 发运/接收目的站（仅发运、接收记录有）
+	Shipment   string    `json:"shipment,omitempty"`   // 运输单号（仅发运、接收记录有）
 	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）、中止原因（仅收回记录有）、续接原因（仅续接记录有）或撤销原因（仅撤销回执记录有）
 	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）或被撤销的原回执请求号（仅撤销回执记录有）
 	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回、续接、撤销回执记录有；续接时为新批次号）
@@ -202,6 +207,32 @@ type RevokeResult struct {
 	Time    time.Time `json:"time"`    // 撤销时间
 }
 
+// ShipmentResult 记录一次成功的站间发运，用于运输单号去重、结果重放与运输单查询。
+// 发运表示整单包裹已离开源站、尚未到达目的站：整单转为“站间在途”，归属站点暂记
+// 源站，成员按首次提交顺序保存，保存后不可修改。运输单号独立于已有各类编号，
+// 接收后也不释放；失败的首次发运不占用运输单号。
+type ShipmentResult struct {
+	Shipment string    `json:"shipment"` // 运输单号
+	From     string    `json:"from"`     // 源站
+	To       string    `json:"to"`       // 目的站
+	Parcels  []string  `json:"parcels"`  // 成员，按首次提交顺序
+	Time     time.Time `json:"time"`     // 发运时间
+	// ReceivedBy 为接收该运输单的接收请求号（未接收为空）；接收永久生效，每单只能成功接收一次。
+	ReceivedBy string `json:"receivedBy,omitempty"`
+}
+
+// ReceiveResult 记录一次成功的整单到站接收，用于接收请求号去重与结果重放。
+// 接收表示运输单全部成员已到达目的站：按发运保存顺序全部改归目的站、恢复在站，
+// 运输单永久标记为已接收。接收请求号与运输单号及已有各类编号分属独立去重范围，
+// 允许同名；失败的首次接收不占用请求号。
+type ReceiveResult struct {
+	Request  string    `json:"request"`  // 接收请求号
+	Shipment string    `json:"shipment"` // 被接收的运输单号
+	Station  string    `json:"station"`  // 接收站点（即运输单目的站）
+	Parcels  []string  `json:"parcels"`  // 全部成员，按发运保存顺序
+	Time     time.Time `json:"time"`     // 接收时间
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
 	Version   int                        `json:"version"`
@@ -215,6 +246,8 @@ type ledgerFile struct {
 	Aborts    map[string]*AbortResult    `json:"aborts"`    // 以中止请求号为键
 	Transfers map[string]*TransferResult `json:"transfers"` // 以续接请求号为键
 	Revokes   map[string]*RevokeResult   `json:"revokes"`   // 以撤销请求号为键
+	Shipments map[string]*ShipmentResult `json:"shipments"` // 以运输单号为键（含已接收的运输单，永久保留）
+	Receives  map[string]*ReceiveResult  `json:"receives"`  // 以接收请求号为键
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -240,7 +273,8 @@ func Open(path string) (*Store, error) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
 				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{},
 				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{},
-				Transfers: map[string]*TransferResult{}, Revokes: map[string]*RevokeResult{}}
+				Transfers: map[string]*TransferResult{}, Revokes: map[string]*RevokeResult{}, Shipments: map[string]*ShipmentResult{},
+				Receives: map[string]*ReceiveResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -279,6 +313,13 @@ func Open(path string) (*Store, error) {
 	if s.data.Revokes == nil {
 		s.data.Revokes = map[string]*RevokeResult{}
 	}
+	// 早期版本的数据文件没有 shipments/receives 字段：按空表处理，无需手工修改。
+	if s.data.Shipments == nil {
+		s.data.Shipments = map[string]*ShipmentResult{}
+	}
+	if s.data.Receives == nil {
+		s.data.Receives = map[string]*ReceiveResult{}
+	}
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
 			b.Receipts = map[string]*ReceiptEntry{}
@@ -297,7 +338,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 包裹 %q 记录不完整", ErrCorrupt, id)
 		}
 		switch p.Status {
-		case statusInStation, statusDelivering, statusSigned, statusFrozen:
+		case statusInStation, statusDelivering, statusSigned, statusFrozen, statusInTransit:
 		default:
 			return fmt.Errorf("%w: 包裹 %q 的状态 %q 不受支持", ErrCorrupt, id, p.Status)
 		}
@@ -395,6 +436,50 @@ func (l *ledgerFile) validate() error {
 				}
 				if !inTransfer {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹不在续接请求 %q 的转交集合中", ErrCorrupt, id, i+1, e.Request)
+				}
+			}
+			if e.Op == "发运" {
+				if e.Shipment == "" || e.From == "" || e.To == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹缺少运输单号、源站或目的站", ErrCorrupt, id, i+1)
+				}
+				sh, ok := l.Shipments[e.Shipment]
+				if !ok {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹引用了不存在的运输单 %q", ErrCorrupt, id, i+1, e.Shipment)
+				}
+				if sh.From != e.From || sh.To != e.To || e.Station != e.From || !sh.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹与运输单 %q 记录不一致", ErrCorrupt, id, i+1, e.Shipment)
+				}
+				inShipment := false
+				for _, pid := range sh.Parcels {
+					if pid == id {
+						inShipment = true
+						break
+					}
+				}
+				if !inShipment {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹不在运输单 %q 的成员集合中", ErrCorrupt, id, i+1, e.Shipment)
+				}
+			}
+			if e.Op == "接收" {
+				if e.Shipment == "" || e.Request == "" || e.From == "" || e.To == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹缺少运输单号、接收请求号、源站或目的站", ErrCorrupt, id, i+1)
+				}
+				rv, ok := l.Receives[e.Request]
+				if !ok {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用了不存在的接收请求 %q", ErrCorrupt, id, i+1, e.Request)
+				}
+				if rv.Shipment != e.Shipment || rv.Station != e.Station || e.Station != e.To || !rv.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹与接收请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				inReceive := false
+				for _, pid := range rv.Parcels {
+					if pid == id {
+						inReceive = true
+						break
+					}
+				}
+				if !inReceive {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹不在接收请求 %q 的成员集合中", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
 			if e.Op == "冻结" {
@@ -684,6 +769,94 @@ func (l *ledgerFile) validate() error {
 			}
 			if !found {
 				return fmt.Errorf("%w: 续接请求号 %q 的转交包裹 %q 缺少对应的续接轨迹", ErrCorrupt, req, pid)
+			}
+		}
+	}
+	// 发运：成员必须非空、不重复且都已登记，每件成员的轨迹中都有与该运输单一致的
+	// 发运记录；未接收运输单的成员必须仍归该单在途（状态为站间在途、归属源站），
+	// 且一件包裹同时只能属于一张未接收运输单；关联缺失或矛盾即损坏。
+	inTransitCount := make(map[string]int) // 包裹 -> 包含它的未接收运输单数
+	for no, sh := range l.Shipments {
+		if sh == nil || no != sh.Shipment || sh.From == "" || sh.To == "" || sh.From == sh.To ||
+			len(sh.Parcels) == 0 || sh.Time.IsZero() {
+			return fmt.Errorf("%w: 运输单号 %q 的发运结果不完整", ErrCorrupt, no)
+		}
+		seen := make(map[string]bool, len(sh.Parcels))
+		for _, pid := range sh.Parcels {
+			if seen[pid] {
+				return fmt.Errorf("%w: 运输单 %q 的成员 %q 重复", ErrCorrupt, no, pid)
+			}
+			seen[pid] = true
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 运输单 %q 引用了不存在的包裹 %q", ErrCorrupt, no, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "发运" && e.Shipment == no {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 运输单 %q 的成员包裹 %q 缺少对应的发运轨迹", ErrCorrupt, no, pid)
+			}
+		}
+		if sh.ReceivedBy != "" {
+			r, ok := l.Receives[sh.ReceivedBy]
+			if !ok || r.Shipment != no {
+				return fmt.Errorf("%w: 运输单 %q 标记的接收请求号 %q 无法对应", ErrCorrupt, no, sh.ReceivedBy)
+			}
+			continue
+		}
+		for _, pid := range sh.Parcels {
+			p := l.Parcels[pid]
+			inTransitCount[pid]++
+			if p.Status != statusInTransit || p.Station != sh.From {
+				return fmt.Errorf("%w: 运输单 %q 尚未接收，但成员包裹 %q 当前归属 %q、状态 %q，不在该单在途",
+					ErrCorrupt, no, pid, p.Station, p.Status)
+			}
+		}
+	}
+	for id, p := range l.Parcels {
+		if p.Status == statusInTransit && inTransitCount[id] != 1 {
+			return fmt.Errorf("%w: 包裹 %q 当前为站间在途，但未接收运输单数为 %d，应恰好属于一张未接收运输单",
+				ErrCorrupt, id, inTransitCount[id])
+		}
+	}
+	// 接收：接收站点必须等于运输单目的站，成员必须恰为运输单原成员（按发运保存顺序），
+	// 且每件成员的轨迹中都有与该接收请求一致的接收记录；关联缺失或矛盾即损坏。
+	for req, r := range l.Receives {
+		if r == nil || req != r.Request || r.Shipment == "" || r.Station == "" || len(r.Parcels) == 0 || r.Time.IsZero() {
+			return fmt.Errorf("%w: 接收请求号 %q 的接收结果不完整", ErrCorrupt, req)
+		}
+		sh, ok := l.Shipments[r.Shipment]
+		if !ok {
+			return fmt.Errorf("%w: 接收请求号 %q 引用了不存在的运输单 %q", ErrCorrupt, req, r.Shipment)
+		}
+		if sh.ReceivedBy != req {
+			return fmt.Errorf("%w: 接收请求号 %q 与运输单 %q 的接收标记不一致", ErrCorrupt, req, r.Shipment)
+		}
+		if r.Station != sh.To {
+			return fmt.Errorf("%w: 接收请求号 %q 的接收站点 %q 与运输单 %q 目的站 %q 不一致", ErrCorrupt, req, r.Station, r.Shipment, sh.To)
+		}
+		if !sameOrder(r.Parcels, sh.Parcels) {
+			return fmt.Errorf("%w: 接收请求号 %q 的成员与运输单 %q 的原成员不一致", ErrCorrupt, req, r.Shipment)
+		}
+		for _, pid := range r.Parcels {
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 接收请求号 %q 引用了不存在的包裹 %q", ErrCorrupt, req, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "接收" && e.Request == req {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 接收请求号 %q 的成员包裹 %q 缺少对应的接收轨迹", ErrCorrupt, req, pid)
 			}
 		}
 	}
@@ -1778,6 +1951,203 @@ func (s *Store) TransferOf(request string) *TransferResult {
 	return s.data.Transfers[request]
 }
 
+// Ship 提交一次站间发运：整单包裹离开源站、尚未到达目的站。
+//
+// 首次发运：每件包裹必须已登记、当前归属源站且状态为在站；任一不满足则整单拒绝，
+// 不作任何改动（在途、配送中、已签收或已冻结的包裹均不满足）。全部满足时整单转为
+// “站间在途”（归属站点暂记源站），每件追加一条含运输单号、两站和时间的发运记录；
+// 成员按首次提交顺序保存，保存后不可修改。每件包裹同时最多属于一张未接收运输单。
+// 发运算新的流转：发运后不能退回此前的旧交接；运输单不是交接，不能作为退回的原交接。
+// 运输单号独立于已有各类编号，接收后也不释放：相同运输单号且源站、目的站、包裹集合
+// 相同（集合顺序无关），直接返回首次成员顺序与发运时间，replayed 为 true，不检查现状、
+// 不追加轨迹、不改写台账；运输单号相同但内容不同报冲突；失败的首次发运不占用运输单号。
+func (s *Store) Ship(shipment, from, to string, parcels []string, now time.Time) (res *ShipmentResult, replayed bool, err error) {
+	if saved, ok := s.data.Shipments[shipment]; ok {
+		if saved.From == from && saved.To == to && sameSet(saved.Parcels, parcels) {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("运输单号 %q 已用于一次不同的发运（源站=%q 目的站=%q），内容冲突", shipment, saved.From, saved.To)
+	}
+
+	// 首次发运：先做全部校验，任何一件不满足都整单拒绝。
+	for _, id := range parcels {
+		p, ok := s.data.Parcels[id]
+		if !ok {
+			return nil, false, fmt.Errorf("发运失败：包裹 %q 未登记，整单发运未执行", id)
+		}
+		if p.Station != from {
+			return nil, false, fmt.Errorf("发运失败：包裹 %q 当前归属 %q，不在源站 %q，整单发运未执行", id, p.Station, from)
+		}
+		if p.Status != statusInStation {
+			return nil, false, fmt.Errorf("发运失败：包裹 %q 当前状态为 %q，不是在站，整单发运未执行", id, p.Status)
+		}
+	}
+
+	res = &ShipmentResult{
+		Shipment: shipment,
+		From:     from,
+		To:       to,
+		Parcels:  append([]string(nil), parcels...),
+		Time:     now,
+	}
+	s.data.Shipments[shipment] = res
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string]struct {
+		status string
+		trail  []Event
+	}, len(parcels))
+	for _, id := range parcels {
+		p := s.data.Parcels[id]
+		prev[id] = struct {
+			status string
+			trail  []Event
+		}{p.Status, append([]Event(nil), p.Trail...)}
+		p.Status = statusInTransit // 归属站点暂记源站，整单转为站间在途
+		p.Trail = append(p.Trail, Event{
+			Op:       "发运",
+			Station:  from,
+			From:     from,
+			To:       to,
+			Shipment: shipment,
+			Time:     now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Shipments, shipment)
+		for id, old := range prev {
+			p := s.data.Parcels[id]
+			p.Status = old.status
+			p.Trail = old.trail
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// Receive 提交一次整单到站接收：运输单全部成员到达目的站。成员取自运输单，不另选。
+//
+// 首次接收：运输单必须存在且尚未接收，接收站点必须等于运输单目的站，全部成员必须
+// 仍归该单在途且归属源站；任一不满足则整单拒绝，不作任何改动。成功时按发运保存
+// 顺序将全部成员改归目的站、恢复“在站”，各追加一条含运输单号、两站、接收请求号
+// 和时间的接收记录，运输单永久标记为已接收，随后可继续在站作业。
+// 接收算新的流转：接收后不能退回此前的旧交接。
+// 接收请求号与运输单号及已有各类编号分属独立去重范围，允许同名：相同接收请求号且
+// 运输单、接收站点相同，直接返回首次接收结果与时间，replayed 为 true，不检查现状、
+// 不追加轨迹、不改写台账（接收后包裹再流转也照常重放）；请求号相同但内容不同报冲突；
+// 换请求号再次接收同一运输单拒绝；失败的首次接收不占用请求号。
+func (s *Store) Receive(request, shipment, station string, now time.Time) (res *ReceiveResult, replayed bool, err error) {
+	if saved, ok := s.data.Receives[request]; ok {
+		if saved.Shipment == shipment && saved.Station == station {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("接收请求号 %q 已用于一次不同的接收（运输单=%q 接收站点=%q），内容冲突",
+			request, saved.Shipment, saved.Station)
+	}
+
+	sh, ok := s.data.Shipments[shipment]
+	if !ok {
+		return nil, false, fmt.Errorf("接收失败：运输单号 %q 不存在", shipment)
+	}
+	if sh.ReceivedBy != "" {
+		return nil, false, fmt.Errorf("接收失败：运输单 %q 已接收（接收请求号 %q），每单只能成功接收一次", shipment, sh.ReceivedBy)
+	}
+	if station != sh.To {
+		return nil, false, fmt.Errorf("接收失败：接收站点 %q 不是运输单 %q 的目的站 %q，整单接收未执行", station, shipment, sh.To)
+	}
+
+	// 先做全部校验：全部成员必须仍归该单在途且归属源站，任一不符整单拒绝。
+	for _, pid := range sh.Parcels {
+		p := s.data.Parcels[pid] // 运输单成员必已登记（载入校验保证）
+		if p.Status != statusInTransit || p.Station != sh.From {
+			return nil, false, fmt.Errorf("接收失败：包裹 %q 当前归属 %q、状态 %q，不在运输单 %q 从源站 %q 在途，整单接收未执行",
+				pid, p.Station, p.Status, shipment, sh.From)
+		}
+	}
+
+	res = &ReceiveResult{
+		Request:  request,
+		Shipment: shipment,
+		Station:  station,
+		Parcels:  append([]string(nil), sh.Parcels...),
+		Time:     now,
+	}
+	s.data.Receives[request] = res
+	sh.ReceivedBy = request
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string]struct {
+		station string
+		status  string
+		trail   []Event
+	}, len(sh.Parcels))
+	for _, pid := range sh.Parcels {
+		p := s.data.Parcels[pid]
+		prev[pid] = struct {
+			station string
+			status  string
+			trail   []Event
+		}{p.Station, p.Status, append([]Event(nil), p.Trail...)}
+		p.Station = sh.To
+		p.Status = statusInStation
+		p.Trail = append(p.Trail, Event{
+			Op:       "接收",
+			Station:  sh.To,
+			From:     sh.From,
+			To:       sh.To,
+			Shipment: shipment,
+			Request:  request,
+			Time:     now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Receives, request)
+		sh.ReceivedBy = ""
+		for pid, old := range prev {
+			p := s.data.Parcels[pid]
+			p.Station, p.Status = old.station, old.status
+			p.Trail = old.trail
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// ShipmentQuery 按运输单号返回发运结果；运输单不存在时报错。
+func (s *Store) ShipmentQuery(shipment string) (*ShipmentResult, error) {
+	sh, ok := s.data.Shipments[shipment]
+	if !ok {
+		return nil, fmt.Errorf("运输单 %q 不存在", shipment)
+	}
+	return sh, nil
+}
+
+// ReceiveOf 按接收请求号返回接收结果；不存在时返回 nil。
+func (s *Store) ReceiveOf(request string) *ReceiveResult {
+	return s.data.Receives[request]
+}
+
+// ActiveShipment 返回包裹当前所属的未接收运输单；包裹不存在或不在站间在途时返回 nil。
+func (s *Store) ActiveShipment(id string) *ShipmentResult {
+	p, ok := s.data.Parcels[id]
+	if !ok || p.Status != statusInTransit {
+		return nil
+	}
+	for _, sh := range s.data.Shipments {
+		if sh.ReceivedBy != "" {
+			continue
+		}
+		for _, pid := range sh.Parcels {
+			if pid == id {
+				return sh
+			}
+		}
+	}
+	return nil
+}
+
 // currentBatch 返回包裹当前配送归属的批次号（最后一条出站或续接记录的批次）；
 // 不在配送中返回空。续接不新增出站记录，但会把当前配送归属切换到新批次。
 func currentBatch(p *Parcel) string {
@@ -1803,7 +2173,7 @@ func activeFreeze(p *Parcel) string {
 	return ""
 }
 
-// lastFlowEvent 返回轨迹中最后一条真实流转记录（交接/退回/出站/回执/收回）。
+// lastFlowEvent 返回轨迹中最后一条真实流转记录（交接/退回/出站/回执/收回/续接/撤销回执/发运/接收）。
 // 冻结与解除只是管理记录，不算新流转，判定旧交接可否退回时须跳过它们。
 func lastFlowEvent(trail []Event) Event {
 	for i := len(trail) - 1; i >= 0; i-- {

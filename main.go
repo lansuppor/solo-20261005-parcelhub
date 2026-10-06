@@ -100,6 +100,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdAbort(dataFile, rest[1:], stdout, stderr)
 	case "relay":
 		return cmdRelay(dataFile, rest[1:], stdout, stderr)
+	case "ship":
+		return cmdShip(dataFile, rest[1:], stdout, stderr)
+	case "receive":
+		return cmdReceive(dataFile, rest[1:], stdout, stderr)
+	case "shipment":
+		return cmdShipment(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -140,6 +146,9 @@ func printHelp(w io.Writer) {
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
   abort                  配送批次中止：未回执包裹全部收回出发站，批次永久关闭
   relay                  配送途中整批续接：原批次未回执包裹交给另一配送员，新建批次继续配送
+  ship                   站间发运：整单包裹离开源站、转为“站间在途”，归属站点暂记源站
+  receive                整单到站接收：运输单全部成员改归目的站、恢复在站，运输单永久标记已接收
+  shipment               按运输单号查询两站、原成员、待接收或已接收状态、发运与接收信息
 
 常用示例:
   %s register --id P001 --station 站点A
@@ -158,6 +167,10 @@ func printHelp(w io.Writer) {
   %s unfreeze --request U1 --incident E1 --note 已核实放行
   %s abort    --request A1 --batch B1 --reason 车辆故障全部收回
   %s relay    --request T1 --from B1 --to B2 --courier 李四 --reason 原配送员车辆故障
+  %s ship     --shipment S1 --from 站点A --to 站点B \
+              --parcel P001 --parcel P002
+  %s receive  --request RS1 --shipment S1 --station 站点B
+  %s shipment --id S1
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
@@ -167,7 +180,7 @@ func printHelp(w io.Writer) {
 与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch 每次读取
 一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
 终止）自动释放，无需人工删除协调文件（<数据文件>.lock）。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -193,7 +206,8 @@ func printQueryHelp(w io.Writer) {
   %s query [--data FILE] --id 包裹编号
 
 展示当前站点、当前状态、当前未解除异常（若有）及按提交顺序排列的完整轨迹；
-配送中包裹同时展示当前批次与当前配送员。
+配送中包裹同时展示当前批次与当前配送员；站间在途包裹同时展示当前运输单号
+与目的站。
 交接记录同时显示请求号；退回记录同时显示源站、目的站、
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
@@ -202,7 +216,9 @@ func printQueryHelp(w io.Writer) {
 中止请求号、原因、站点和时间；续接记录显示原批次号、新批次号、
 新配送员、续接请求号、原因、站点和时间；撤销回执记录显示批次号、
 撤销请求号、原回执请求号、原因、站点和时间，已被撤销的回执记录
-同时标注撤销状态。包裹不存在时报错，不会创建记录。
+同时标注撤销状态；发运记录显示运输单号、源站、目的站和时间；
+接收记录显示运输单号、接收请求号、源站、目的站和时间。
+包裹不存在时报错，不会创建记录。
 
 示例:
   %s query --id P001
@@ -502,5 +518,71 @@ func printUnfreezeHelp(w io.Writer) {
 
 示例:
   %s unfreeze --request U1 --incident E1 --note 已核实放行
+`, appName, appName, appName)
+}
+
+func printShipHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s ship — 站间发运（整单包裹离开源站、尚未到达目的站）
+
+用法:
+  %s ship [--data FILE] --shipment 运输单号 --from 源站点 --to 目的站点 \
+          --parcel 包裹编号 [--parcel 包裹编号 ...]
+
+规则:
+  - 运输单号、源站点、目的站点及每个包裹编号均去除两端空白，不可为空或仅含空白
+  - 包裹集合不可为空且编号不可重复；源站点与目的站点不能相同
+  - 首次发运：每件包裹必须已登记、在源站且状态为在站；
+    任一不满足则整单拒绝，其他包裹的状态与轨迹均不变
+  - 全部满足时整单转为“站间在途”（归属站点暂记源站），每件追加一条
+    含运输单号、两站和时间的发运记录；成员按首次提交顺序保存，不可修改
+  - 每件包裹同时最多属于一张未接收运输单；在途件不能首次交接、退回、
+    配送出站或冻结，涉及它的批量操作整批不变
+  - 发运算新的流转：发运后不能退回此前的旧交接；运输单不能作为退回的原交接
+  - 运输单号独立于已有各类编号，接收后也不能复用：相同运输单号且源站、
+    目的站、包裹集合相同（集合顺序无关）直接返回首次成员顺序与发运时间，
+    不再追加轨迹；运输单号相同但内容不同报冲突；失败的发运不占用运输单号
+
+示例:
+  %s ship --shipment S1 --from 站点A --to 站点B --parcel P001 --parcel P002
+`, appName, appName, appName)
+}
+
+func printReceiveHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s receive — 整单到站接收（运输单全部成员到达目的站）
+
+用法:
+  %s receive [--data FILE] --request 接收请求号 --shipment 运输单号 --station 接收站点
+
+规则:
+  - 接收请求号、运输单号、接收站点均去除两端空白，不可为空或仅含空白
+  - 成员取自运输单，不允许另选包裹
+  - 首次接收：运输单必须存在且尚未接收，接收站点必须等于运输单目的站，
+    全部成员必须仍归该单在途且归属源站；任一不满足则整单拒绝，不作任何改动
+  - 成功时按发运保存顺序将全部成员改归目的站、恢复“在站”，各追加一条
+    含运输单号、两站、接收请求号和时间的接收记录；运输单永久标记为已接收，
+    随后可继续在站作业；接收算新的流转，接收后不能退回此前的旧交接
+  - 接收请求号与运输单号及已有各类编号分属独立去重范围，允许同名：
+    相同接收请求号且运输单、接收站点相同，直接返回首次接收结果与时间，
+    不检查现状、不再追加轨迹（接收后包裹再流转也照常重放）；
+    请求号相同但内容不同报冲突；换请求号再次接收同一运输单拒绝；
+    失败的首次接收不占用请求号
+
+示例:
+  %s receive --request RS1 --shipment S1 --station 站点B
+`, appName, appName, appName)
+}
+
+func printShipmentHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s shipment — 按运输单号查询站间运输单
+
+用法:
+  %s shipment [--data FILE] --id 运输单号
+
+展示源站、目的站、原成员（按首次提交顺序）、运输单状态（待接收 / 已接收）、
+发运时间；已接收的运输单同时展示接收请求号、接收站点与接收时间。
+运输单不存在时报错。
+
+示例:
+  %s shipment --id S1
 `, appName, appName, appName)
 }
