@@ -128,13 +128,20 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  %d. 操作: 出站    站点: %s    批次号: %s    配送员: %s    时间: %s\n",
 				i+1, e.Station, e.Batch, e.Courier, e.Time.Format(timeFmt))
 		case "回执":
-			if e.Result == resultFailed {
-				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    原因: %s    请求号: %s    时间: %s\n",
-					i+1, e.Station, e.Batch, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt))
-			} else {
-				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    请求号: %s    时间: %s\n",
-					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt))
+			revoked := ""
+			if rc := store.ReceiptOf(e.Request); rc != nil && rc.RevokedBy != "" {
+				revoked = fmt.Sprintf("    已撤销（撤销请求号: %s）", rc.RevokedBy)
 			}
+			if e.Result == resultFailed {
+				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    原因: %s    请求号: %s    时间: %s%s\n",
+					i+1, e.Station, e.Batch, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt), revoked)
+			} else {
+				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    请求号: %s    时间: %s%s\n",
+					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt), revoked)
+			}
+		case "撤销":
+			fmt.Fprintf(stdout, "  %d. 操作: 撤销    站点: %s    批次号: %s    撤销请求号: %s    原回执请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Station, e.Batch, e.Request, e.RefRequest, e.Reason, e.Time.Format(timeFmt))
 		case "冻结":
 			fmt.Fprintf(stdout, "  %d. 操作: 冻结    站点: %s    异常单号: %s    原因: %s    时间: %s\n",
 				i+1, e.Station, e.Incident, e.Reason, e.Time.Format(timeFmt))
@@ -429,6 +436,9 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	if res.Result == resultFailed {
 		fmt.Fprintf(stdout, "原因: %s\n", res.Reason)
 	}
+	if res.RevokedBy != "" {
+		fmt.Fprintf(stdout, "该回执已撤销（撤销请求号: %s），本次为历史重放，不恢复回执或改变当前状态\n", res.RevokedBy)
+	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
 	return exitOK
 }
@@ -551,7 +561,9 @@ func cmdReceiptImport(dataFile string, argv []string, stdout, stderr io.Writer) 
 	fmt.Fprintf(stdout, "回执导入成功（共 %d 条：新增 %d 条，重放 %d 条）\n", len(items), len(items)-replayed, replayed)
 	for i, it := range items {
 		mark := "新增"
-		if it.Replayed {
+		if it.Replayed && it.Revoked {
+			mark = "重放（返回首次保存的结果，该回执已撤销，不恢复回执）"
+		} else if it.Replayed {
 			mark = "重放（返回首次保存的结果）"
 		}
 		line := fmt.Sprintf("  %d. 请求号: %s    批次号: %s    包裹编号: %s    结果: %s",
@@ -621,6 +633,12 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			tr.ToBatch, tr.ToCourier, tr.Request, tr.Reason, tr.Time.Format(timeFmt))
 	}
 	fmt.Fprintf(stdout, "逐件回执（%d/%d 已回执）:\n", len(b.Receipts), len(b.Parcels))
+	printRevokes := func(pid string) {
+		for _, rv := range store.ParcelRevokes(cleanIDVal, pid) {
+			fmt.Fprintf(stdout, "      撤销历史: 原回执请求号: %s    撤销请求号: %s    原因: %s    时间: %s\n",
+				rv.Receipt, rv.Request, rv.Reason, rv.Time.Format(timeFmt))
+		}
+	}
 	for _, pid := range b.Parcels {
 		e, ok := b.Receipts[pid]
 		if !ok {
@@ -634,6 +652,7 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			default:
 				fmt.Fprintf(stdout, "  - %s    未回执\n", pid)
 			}
+			printRevokes(pid)
 			continue
 		}
 		if e.Result == resultFailed {
@@ -643,6 +662,7 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  - %s    已回执    结果: %s    请求号: %s    时间: %s\n",
 				pid, e.Result, e.Request, e.Time.Format(timeFmt))
 		}
+		printRevokes(pid)
 	}
 	return exitOK
 }
@@ -856,5 +876,51 @@ func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReceiptRevoke(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("receipt-revoke", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "撤销请求号（独立去重）")
+	receipt := fs.String("receipt", "", "被撤销的原回执请求号")
+	reason := fs.String("reason", "", "撤销原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiptRevokeHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("撤销请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReceipt, err := cleanID("原回执请求号", *receipt)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("撤销原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
+		return exitBusiness
+	}
+	res, replayed, err := store.Revoke(cleanReq, cleanReceipt, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "撤销成功"
+	if replayed {
+		headline = "撤销成功（撤销请求号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n撤销请求号: %s\n原回执请求号: %s\n批次号: %s\n包裹编号: %s\n撤销原因: %s\n发生时间: %s\n",
+		headline, res.Request, res.Receipt, res.Batch, res.Parcel, res.Reason, res.Time.Format(timeFmt))
 	return exitOK
 }
