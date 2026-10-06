@@ -378,7 +378,7 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条撤销回执轨迹缺少批次号、撤销请求号、原回执请求号或原因", ErrCorrupt, id, i+1)
 				}
 				b, ok := l.Batches[e.Batch]
-				if !ok {
+				if !ok || b == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条撤销回执轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
 				}
 				if e.Station != b.Station {
@@ -386,7 +386,7 @@ func (l *ledgerFile) validate() error {
 						ErrCorrupt, id, i+1, e.Station, e.Batch, b.Station)
 				}
 				rv, ok := l.Revokes[e.Request]
-				if !ok {
+				if !ok || rv == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条撤销回执轨迹引用了不存在的撤销请求 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 				if rv.Receipt != e.RefRequest || rv.Batch != e.Batch || rv.Parcel != id || rv.Reason != e.Reason || !rv.Time.Equal(e.Time) {
@@ -398,7 +398,7 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹缺少批次号、中止请求号或原因", ErrCorrupt, id, i+1)
 				}
 				a, ok := l.Aborts[e.Request]
-				if !ok {
+				if !ok || a == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条收回轨迹引用了不存在的中止请求 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 				if a.Batch != e.Batch || a.Station != e.Station || a.Reason != e.Reason || !a.Time.Equal(e.Time) {
@@ -420,7 +420,7 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹缺少新批次号、原批次号、新配送员、续接请求号或原因", ErrCorrupt, id, i+1)
 				}
 				t, ok := l.Transfers[e.Request]
-				if !ok {
+				if !ok || t == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条续接轨迹引用了不存在的续接请求 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 				if t.FromBatch != e.FromBatch || t.ToBatch != e.Batch || t.ToCourier != e.Courier ||
@@ -443,7 +443,7 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹缺少运输单号、源站或目的站", ErrCorrupt, id, i+1)
 				}
 				sh, ok := l.Shipments[e.Shipment]
-				if !ok {
+				if !ok || sh == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条发运轨迹引用了不存在的运输单 %q", ErrCorrupt, id, i+1, e.Shipment)
 				}
 				if sh.From != e.From || sh.To != e.To || e.Station != e.From || !sh.Time.Equal(e.Time) {
@@ -465,11 +465,19 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹缺少运输单号、接收请求号、源站或目的站", ErrCorrupt, id, i+1)
 				}
 				rv, ok := l.Receives[e.Request]
-				if !ok {
+				if !ok || rv == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用了不存在的接收请求 %q", ErrCorrupt, id, i+1, e.Request)
 				}
 				if rv.Shipment != e.Shipment || rv.Station != e.Station || e.Station != e.To || !rv.Time.Equal(e.Time) {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹与接收请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				sh, ok := l.Shipments[e.Shipment]
+				if !ok || sh == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹引用了不存在的运输单 %q", ErrCorrupt, id, i+1, e.Shipment)
+				}
+				if sh.From != e.From || sh.To != e.To {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹的源站或目的站与运输单 %q 记录（%q -> %q）不一致",
+						ErrCorrupt, id, i+1, e.Shipment, sh.From, sh.To)
 				}
 				inReceive := false
 				for _, pid := range rv.Parcels {
@@ -487,7 +495,7 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条冻结轨迹缺少异常单号或原因", ErrCorrupt, id, i+1)
 				}
 				f, ok := l.Freezes[e.Incident]
-				if !ok {
+				if !ok || f == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条冻结轨迹引用了不存在的异常单 %q", ErrCorrupt, id, i+1, e.Incident)
 				}
 				if f.Parcel != id || f.Reason != e.Reason || f.Station != e.Station || !f.Time.Equal(e.Time) {
@@ -499,17 +507,87 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除冻结轨迹缺少异常单号、解除请求号或处理说明", ErrCorrupt, id, i+1)
 				}
 				f, ok := l.Freezes[e.Incident]
-				if !ok {
+				if !ok || f == nil {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除冻结轨迹引用了不存在的异常单 %q", ErrCorrupt, id, i+1, e.Incident)
 				}
 				if f.Parcel != id || f.Station != e.Station || f.ReleasedBy != e.Request {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除冻结轨迹与异常单 %q 不匹配", ErrCorrupt, id, i+1, e.Incident)
 				}
 				u, ok := l.Unfreezes[e.Request]
-				if !ok || u.Incident != e.Incident || u.Parcel != id || u.Note != e.Note || !u.Time.Equal(e.Time) {
+				if !ok || u == nil || u.Incident != e.Incident || u.Parcel != id || u.Note != e.Note || !u.Time.Equal(e.Time) {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除冻结轨迹与解除请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
+		}
+	}
+	// 站间运输生命周期：按每件轨迹的保存顺序（不按发生时间排序）核对发运与接收的
+	// 配对关系。每张运输单的成员恰有一次对应发运；已接收时恰有一次对应接收且位于
+	// 发运之后；发运后到接收前不得出现其他作业轨迹；未接收时不得有接收记录，
+	// 发运必须是最后一条轨迹。
+	for id, p := range l.Parcels {
+		shipped := make(map[string]bool) // 该包裹轨迹中已出现发运的运输单号
+		var open string                  // 已发运、尚未在轨迹中接收的在途运输单号
+		for i, e := range p.Trail {
+			if open != "" && e.Op != "接收" {
+				return fmt.Errorf("%w: 包裹 %q 第 %d 条轨迹（%s）出现在运输单 %q 发运之后、接收之前，在途期间不得有其他作业轨迹",
+					ErrCorrupt, id, i+1, e.Op, open)
+			}
+			switch e.Op {
+			case "发运":
+				if shipped[e.Shipment] {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条轨迹重复发运运输单 %q，每张运输单的成员恰有一次对应发运",
+						ErrCorrupt, id, i+1, e.Shipment)
+				}
+				shipped[e.Shipment] = true
+				open = e.Shipment
+			case "接收":
+				if open == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹（运输单 %q）位于对应发运之前或缺少对应发运",
+						ErrCorrupt, id, i+1, e.Shipment)
+				}
+				if e.Shipment != open {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条接收轨迹的运输单 %q 与当前在途运输单 %q 不匹配",
+						ErrCorrupt, id, i+1, e.Shipment, open)
+				}
+				open = ""
+			}
+		}
+		if open != "" {
+			sh := l.Shipments[open] // 发运轨迹校验已保证运输单存在且非空
+			if sh.ReceivedBy != "" {
+				return fmt.Errorf("%w: 包裹 %q 的运输单 %q 已接收（接收请求号 %q），但轨迹缺少对应的接收记录",
+					ErrCorrupt, id, open, sh.ReceivedBy)
+			}
+		}
+	}
+	// 当前归属与状态必须由轨迹记录形成：按保存顺序的最后一条轨迹推导应有的归属
+	// 站点与状态，与台账当前值不一致即存在无对应记录的站点或状态改变。接收后的
+	// 合法后续流转（交接、再次发运、回执及其撤销、收回、续接、冻结与解除）会
+	// 产生新的末条轨迹，按新轨迹校验，不因历史接收而把成员固定在目的站。
+	for id, p := range l.Parcels {
+		last := p.Trail[len(p.Trail)-1]
+		var want string
+		switch last.Op {
+		case "收件", "交接", "退回", "收回", "接收", "解除冻结":
+			want = statusInStation
+		case "出站", "续接", "撤销回执":
+			want = statusDelivering
+		case "回执":
+			if last.Result == resultSigned {
+				want = statusSigned
+			} else {
+				want = statusInStation
+			}
+		case "冻结":
+			want = statusFrozen
+		case "发运":
+			want = statusInTransit
+		default:
+			continue // 未知操作不参与推导（逐条校验已兜底）
+		}
+		if p.Station != last.Station || p.Status != want {
+			return fmt.Errorf("%w: 包裹 %q 当前归属 %q、状态 %q 与最后一条轨迹（%s，站点 %q）应形成的归属与状态 %q、%q 不一致",
+				ErrCorrupt, id, p.Station, p.Status, last.Op, last.Station, last.Station, want)
 		}
 	}
 	for req, h := range l.Handoffs {
@@ -523,7 +601,7 @@ func (l *ledgerFile) validate() error {
 		}
 		if h.ReturnedBy != "" {
 			r, ok := l.Returns[h.ReturnedBy]
-			if !ok || r.Handoff != req {
+			if !ok || r == nil || r.Handoff != req {
 				return fmt.Errorf("%w: 交接 %q 标记的退回请求号 %q 无法对应", ErrCorrupt, req, h.ReturnedBy)
 			}
 		}
@@ -534,7 +612,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 退回请求号 %q 的退回结果不完整", ErrCorrupt, req)
 		}
 		h, ok := l.Handoffs[r.Handoff]
-		if !ok {
+		if !ok || h == nil {
 			return fmt.Errorf("%w: 退回请求号 %q 引用了不存在的原交接 %q", ErrCorrupt, req, r.Handoff)
 		}
 		if h.ReturnedBy != req || r.From != h.To || r.To != h.From || !sameSet(r.Parcels, h.Parcels) {
@@ -567,7 +645,7 @@ func (l *ledgerFile) validate() error {
 				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执记录不完整", ErrCorrupt, id, pid)
 			}
 			rc, ok := l.Receipts[e.Request]
-			if !ok || rc.Batch != id || rc.Parcel != pid {
+			if !ok || rc == nil || rc.Batch != id || rc.Parcel != pid {
 				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执请求号 %q 无法对应", ErrCorrupt, id, pid, e.Request)
 			}
 			if e.RevokedBy != rc.RevokedBy {
@@ -576,7 +654,7 @@ func (l *ledgerFile) validate() error {
 		}
 		if b.AbortedBy != "" {
 			a, ok := l.Aborts[b.AbortedBy]
-			if !ok || a.Batch != id {
+			if !ok || a == nil || a.Batch != id {
 				return fmt.Errorf("%w: 批次 %q 标记的中止请求号 %q 无法对应", ErrCorrupt, id, b.AbortedBy)
 			}
 		}
@@ -585,13 +663,13 @@ func (l *ledgerFile) validate() error {
 				return fmt.Errorf("%w: 批次 %q 不能同时标记中止与转交", ErrCorrupt, id)
 			}
 			t, ok := l.Transfers[b.TransferredBy]
-			if !ok || t.FromBatch != id {
+			if !ok || t == nil || t.FromBatch != id {
 				return fmt.Errorf("%w: 批次 %q 标记的续接请求号 %q 无法对应", ErrCorrupt, id, b.TransferredBy)
 			}
 		}
 		if b.RelayedFrom != "" {
 			t, ok := l.Transfers[b.RelayRequest]
-			if !ok || t.ToBatch != id || t.FromBatch != b.RelayedFrom {
+			if !ok || t == nil || t.ToBatch != id || t.FromBatch != b.RelayedFrom {
 				return fmt.Errorf("%w: 批次 %q 标记的续接来源（原批次=%q 续接请求号=%q）无法对应",
 					ErrCorrupt, id, b.RelayedFrom, b.RelayRequest)
 			}
@@ -606,7 +684,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 回执请求号 %q 的回执结果不完整", ErrCorrupt, req)
 		}
 		b, ok := l.Batches[rc.Batch]
-		if !ok {
+		if !ok || b == nil {
 			return fmt.Errorf("%w: 回执请求号 %q 引用了不存在的批次 %q", ErrCorrupt, req, rc.Batch)
 		}
 		// 每件包裹的当前回执条目一旦建立只会被新回执取代、不会删除，
@@ -624,7 +702,7 @@ func (l *ledgerFile) validate() error {
 		}
 		// 已撤销回执：撤销关联必须存在且回指该回执。
 		rv, ok := l.Revokes[rc.RevokedBy]
-		if !ok || rv.Receipt != req {
+		if !ok || rv == nil || rv.Receipt != req {
 			return fmt.Errorf("%w: 回执请求号 %q 标记的撤销请求号 %q 无法对应", ErrCorrupt, req, rc.RevokedBy)
 		}
 		if e.Request == req {
@@ -643,7 +721,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 撤销请求号 %q 的撤销结果不完整", ErrCorrupt, req)
 		}
 		rc, ok := l.Receipts[rv.Receipt]
-		if !ok {
+		if !ok || rc == nil {
 			return fmt.Errorf("%w: 撤销请求号 %q 引用了不存在的原回执 %q", ErrCorrupt, req, rv.Receipt)
 		}
 		if rc.RevokedBy != req {
@@ -676,7 +754,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 中止请求号 %q 的中止结果不完整", ErrCorrupt, req)
 		}
 		b, ok := l.Batches[a.Batch]
-		if !ok {
+		if !ok || b == nil {
 			return fmt.Errorf("%w: 中止请求号 %q 引用了不存在的批次 %q", ErrCorrupt, req, a.Batch)
 		}
 		if b.AbortedBy != req {
@@ -726,7 +804,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 续接请求号 %q 的续接结果不完整", ErrCorrupt, req)
 		}
 		fb, ok := l.Batches[t.FromBatch]
-		if !ok {
+		if !ok || fb == nil {
 			return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的原批次 %q", ErrCorrupt, req, t.FromBatch)
 		}
 		if fb.TransferredBy != req {
@@ -736,7 +814,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 续接请求号 %q 的站点或原配送员与原批次 %q 不一致", ErrCorrupt, req, t.FromBatch)
 		}
 		nb, ok := l.Batches[t.ToBatch]
-		if !ok {
+		if !ok || nb == nil {
 			return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的新批次 %q", ErrCorrupt, req, t.ToBatch)
 		}
 		if nb.RelayedFrom != t.FromBatch || nb.RelayRequest != req {
@@ -804,7 +882,7 @@ func (l *ledgerFile) validate() error {
 		}
 		if sh.ReceivedBy != "" {
 			r, ok := l.Receives[sh.ReceivedBy]
-			if !ok || r.Shipment != no {
+			if !ok || r == nil || r.Shipment != no {
 				return fmt.Errorf("%w: 运输单 %q 标记的接收请求号 %q 无法对应", ErrCorrupt, no, sh.ReceivedBy)
 			}
 			continue
@@ -831,7 +909,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 接收请求号 %q 的接收结果不完整", ErrCorrupt, req)
 		}
 		sh, ok := l.Shipments[r.Shipment]
-		if !ok {
+		if !ok || sh == nil {
 			return fmt.Errorf("%w: 接收请求号 %q 引用了不存在的运输单 %q", ErrCorrupt, req, r.Shipment)
 		}
 		if sh.ReceivedBy != req {
@@ -905,7 +983,7 @@ func (l *ledgerFile) validate() error {
 		}
 		if f.ReleasedBy != "" {
 			u, ok := l.Unfreezes[f.ReleasedBy]
-			if !ok || u.Incident != no || u.Parcel != f.Parcel {
+			if !ok || u == nil || u.Incident != no || u.Parcel != f.Parcel {
 				return fmt.Errorf("%w: 异常单 %q 标记的解除请求号 %q 无法对应", ErrCorrupt, no, f.ReleasedBy)
 			}
 		}
@@ -916,7 +994,7 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 解除请求号 %q 的解除结果不完整", ErrCorrupt, req)
 		}
 		f, ok := l.Freezes[u.Incident]
-		if !ok {
+		if !ok || f == nil {
 			return fmt.Errorf("%w: 解除请求号 %q 引用了不存在的异常单 %q", ErrCorrupt, req, u.Incident)
 		}
 		if f.Parcel != u.Parcel {
