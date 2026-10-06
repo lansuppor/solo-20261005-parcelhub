@@ -231,9 +231,16 @@ var (
 
 // Open 打开（或在文件不存在时建立）一个本地台账。
 // 文件不存在时仅初始化内存结构，真正建文件发生在首次成功保存时。
+// 路径先规范化（绝对路径并求值 . / .. / 符号链接），使同一路径的不同写法
+// 不仅共用同一协调锁，也把临时文件与原子替换落在同一份物理台账上，
+// 避免替换掉指向台账的符号链接而造成两种写法各自落盘。
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
-	raw, err := os.ReadFile(path)
+	canonical, err := canonicalLedgerPath(path)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{path: canonical}
+	raw, err := os.ReadFile(canonical)
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},

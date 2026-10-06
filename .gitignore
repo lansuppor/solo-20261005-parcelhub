@@ -3,3 +3,5 @@
 parcelhub-ledger.json
 *.ledger.json
 /parcelhub
+*.parcelhub-lock
+.parcelhub-*.tmp

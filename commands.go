@@ -40,6 +40,25 @@ func parseFlags(fs *flag.FlagSet, argv []string, stdout, stderr io.Writer, print
 	return true, 0
 }
 
+// acquireAndOpen 先取得该台账的协调锁，再读取最新已提交数据打开台账：
+// 修改命令持排他锁（彼此串行，且与查询互斥），查询命令持共享锁（可并行）。
+// 这样所有受理、去重与整次保存都在最新已提交台账上完成，多个终端并行的
+// 结果等同于某个逐次执行顺序。失败时已打印原因并返回退出码 1。
+func acquireAndOpen(dataFile, mode, cmdName string, stderr io.Writer) (store *Store, lock *ledgerLock, code int) {
+	lock, err := acquireLedgerLock(dataFile, mode)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s %s: %v\n", appName, cmdName, err)
+		return nil, nil, exitBusiness
+	}
+	store, err = Open(dataFile)
+	if err != nil {
+		lock.release()
+		fmt.Fprintf(stderr, "%s %s: %v\n", appName, cmdName, err)
+		return nil, nil, exitBusiness
+	}
+	return store, lock, exitOK
+}
+
 func cmdRegister(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("register", stderr)
 	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
@@ -60,11 +79,11 @@ func cmdRegister(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s register: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "register", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	p, err := store.Register(cleanIDVal, cleanStation, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s register: %v\n", appName, err)
@@ -94,11 +113,11 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s query: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeRead, "query", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	p, err := store.Query(cleanIDVal)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s query: %v\n", appName, err)
@@ -217,11 +236,11 @@ func cmdHandoff(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s handoff: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "handoff", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	result, replayed, err := store.Handoff(cleanReq, cleanFrom, cleanTo, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s handoff: %v\n", appName, err)
@@ -267,11 +286,11 @@ func cmdReturn(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "return", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	result, replayed, err := store.Return(cleanReq, cleanHandoff, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
@@ -346,11 +365,11 @@ func cmdDispatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "dispatch", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	result, replayed, err := store.Dispatch(cleanBatch, cleanStation, cleanCourier, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
@@ -416,11 +435,11 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "receipt", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.Receipt(cleanReq, cleanBatch, cleanParcel, cleanResult, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
@@ -537,6 +556,15 @@ func cmdReceiptImport(dataFile string, argv []string, stdout, stderr io.Writer) 
 		return exitBusiness
 	}
 
+	// 先取得排他协调锁，再读取导入文件与台账：导入的受理、去重与整份原子
+	// 保存都在最新已提交台账上完成，与其他终端的提交串行。
+	lock, err := acquireLedgerLock(dataFile, lockModeWrite)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer lock.release()
+
 	// 输入文件只读；读取、解析或清洗失败时整份不予导入。
 	records, err := loadReceiptImportFile(*file)
 	if err != nil {
@@ -606,11 +634,11 @@ func cmdReceiptRevoke(dataFile string, argv []string, stdout, stderr io.Writer) 
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "receipt-revoke", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.RevokeReceipt(cleanReq, cleanReceipt, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
@@ -640,11 +668,11 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s batch: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeRead, "batch", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	b, err := store.BatchQuery(cleanIDVal)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s batch: %v\n", appName, err)
@@ -750,11 +778,11 @@ func cmdFreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "freeze", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.Freeze(cleanIncident, cleanParcel, cleanStation, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
@@ -797,11 +825,11 @@ func cmdUnfreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "unfreeze", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.Unfreeze(cleanReq, cleanIncident, cleanNote, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
@@ -856,11 +884,11 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "relay", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.Transfer(cleanReq, cleanFrom, cleanTo, cleanCourier, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
@@ -906,11 +934,11 @@ func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
-		return exitBusiness
+	store, lock, code := acquireAndOpen(dataFile, lockModeWrite, "abort", stderr)
+	if code != exitOK {
+		return code
 	}
+	defer lock.release()
 	res, replayed, err := store.Abort(cleanReq, cleanBatch, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
