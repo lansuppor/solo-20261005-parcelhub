@@ -161,6 +161,12 @@ func printHelp(w io.Writer) {
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
+
+并行使用: 多个终端可同时对同一台账作业。修改类命令自动取得该台账的
+进程间排他锁（争用时等待），在锁内读取最新已提交数据后完成受理、去重
+与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch 每次读取
+一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
+终止）自动释放，无需人工删除协调文件（<数据文件>.lock）。
 `, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 

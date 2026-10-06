@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 )
 
@@ -769,6 +770,56 @@ func (l *ledgerFile) validate() error {
 		}
 	}
 	return nil
+}
+
+// coordinationPath 返回数据文件对应的协调文件（锁文件）路径。
+// 相对、绝对及含 .、.. 的写法先归一到同一绝对路径，已存在的符号链接也被解析，
+// 确保同一台账的不同路径写法共用同一把锁；首次创建不存在的台账同样适用。
+func coordinationPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("解析数据文件路径失败: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	} else if dir, derr := filepath.EvalSymlinks(filepath.Dir(abs)); derr == nil {
+		abs = filepath.Join(dir, filepath.Base(abs))
+	}
+	return abs + ".lock", nil
+}
+
+// OpenForUpdate 在进程间排他协调下打开台账，供会改写台账的命令使用：
+// 先取得该台账的锁（其他终端正在作业时等待其完成），再在锁内读取最新已提交
+// 数据；调用方随后完成的受理、去重与整次保存都在最新数据上进行，并行效果
+// 等同于某个逐次执行顺序。返回的 release 必须在本次命令结束时调用（无论成败）。
+// 锁由操作系统随文件描述符管理，持有者进程被强制终止时自动释放，
+// 无需人工删除协调文件即可继续作业。
+func OpenForUpdate(path string) (s *Store, release func(), err error) {
+	lockPath, err := coordinationPath(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, nil, fmt.Errorf("准备协调文件失败: %w", err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("打开协调文件失败: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf("等待台账协调锁失败: %w", err)
+	}
+	release = func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}
+	s, err = Open(path)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return s, release, nil
 }
 
 // Register 执行单件收件登记并将结果整体落盘。

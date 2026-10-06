@@ -60,11 +60,12 @@ func cmdRegister(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s register: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	p, err := store.Register(cleanIDVal, cleanStation, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s register: %v\n", appName, err)
@@ -217,11 +218,12 @@ func cmdHandoff(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s handoff: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	result, replayed, err := store.Handoff(cleanReq, cleanFrom, cleanTo, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s handoff: %v\n", appName, err)
@@ -267,11 +269,12 @@ func cmdReturn(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	result, replayed, err := store.Return(cleanReq, cleanHandoff, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s return: %v\n", appName, err)
@@ -346,11 +349,12 @@ func cmdDispatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	result, replayed, err := store.Dispatch(cleanBatch, cleanStation, cleanCourier, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s dispatch: %v\n", appName, err)
@@ -416,11 +420,12 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.Receipt(cleanReq, cleanBatch, cleanParcel, cleanResult, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt: %v\n", appName, err)
@@ -544,11 +549,12 @@ func cmdReceiptImport(dataFile string, argv []string, stdout, stderr io.Writer) 
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	items, err := store.ImportReceipts(records, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt-import: %v\n", appName, err)
@@ -606,11 +612,12 @@ func cmdReceiptRevoke(dataFile string, argv []string, stdout, stderr io.Writer) 
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.RevokeReceipt(cleanReq, cleanReceipt, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s receipt-revoke: %v\n", appName, err)
@@ -750,11 +757,12 @@ func cmdFreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.Freeze(cleanIncident, cleanParcel, cleanStation, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s freeze: %v\n", appName, err)
@@ -797,11 +805,12 @@ func cmdUnfreeze(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.Unfreeze(cleanReq, cleanIncident, cleanNote, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s unfreeze: %v\n", appName, err)
@@ -856,11 +865,12 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.Transfer(cleanReq, cleanFrom, cleanTo, cleanCourier, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
@@ -906,11 +916,12 @@ func cmdAbort(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	store, err := Open(dataFile)
+	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
 		return exitBusiness
 	}
+	defer release()
 	res, replayed, err := store.Abort(cleanReq, cleanBatch, cleanReason, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s abort: %v\n", appName, err)
