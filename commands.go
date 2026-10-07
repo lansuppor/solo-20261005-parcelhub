@@ -674,17 +674,20 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 
-	status := "配送中"
-	if b.Done() {
-		status = "已完成"
-	}
+	// 批次状态优先级：已中止 > 已永久转交 > 已完成 > 配送中。分批续接期间原批次
+	// 仍有待配送件时为配送中；余件全部经回执办结（无待配送件）时为已完成；
+	// 续接转走最后一件待配送件时永久关闭为已转交。
 	ab := store.BatchAbort(cleanIDVal)
-	if ab != nil {
+	closedTr := store.BatchTransferSource(cleanIDVal)
+	allTransfers := store.BatchTransfers(cleanIDVal)
+	status := "配送中"
+	switch {
+	case ab != nil:
 		status = "已中止"
-	}
-	tr := store.BatchTransferSource(cleanIDVal)
-	if tr != nil {
+	case closedTr != nil:
 		status = "已转交"
+	case len(store.batchOpen(b)) == 0:
+		status = "已完成"
 	}
 	timeLabel := "出站时间"
 	if b.RelayedFrom != "" {
@@ -701,18 +704,19 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "中止请求号: %s\n中止原因: %s\n中止时间: %s\n",
 			ab.Request, ab.Reason, ab.Time.Format(timeFmt))
 	}
-	if tr != nil {
+	if closedTr != nil {
 		fmt.Fprintf(stdout, "转交去向: 批次 %s（新配送员: %s）\n续接请求号: %s\n续接原因: %s\n转交时间: %s\n",
-			tr.ToBatch, tr.ToCourier, tr.Request, tr.Reason, tr.Time.Format(timeFmt))
+			closedTr.ToBatch, closedTr.ToCourier, closedTr.Request, closedTr.Reason, closedTr.Time.Format(timeFmt))
 	}
 	fmt.Fprintf(stdout, "逐件回执（%d/%d 已回执）:\n", b.Effective(), len(b.Parcels))
 	for _, pid := range b.Parcels {
 		e, ok := b.Receipts[pid]
 		if !ok || e.RevokedBy != "" {
 			switch {
-			case tr != nil:
-				fmt.Fprintf(stdout, "  - %s    已转交    去向批次: %s    续接请求号: %s    时间: %s\n",
-					pid, tr.ToBatch, tr.Request, tr.Time.Format(timeFmt))
+			case store.transferOfParcel(cleanIDVal, pid) != nil:
+				tr := store.transferOfParcel(cleanIDVal, pid)
+				fmt.Fprintf(stdout, "  - %s    已转交    去向批次: %s    新配送员: %s    续接请求号: %s    时间: %s\n",
+					pid, tr.ToBatch, tr.ToCourier, tr.Request, tr.Time.Format(timeFmt))
 			case ab != nil:
 				fmt.Fprintf(stdout, "  - %s    已收回    中止请求号: %s    原因: %s    时间: %s\n",
 					pid, ab.Request, ab.Reason, ab.Time.Format(timeFmt))
@@ -729,6 +733,16 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		} else {
 			fmt.Fprintf(stdout, "  - %s    已回执    结果: %s    请求号: %s    时间: %s\n",
 				pid, e.Result, e.Request, e.Time.Format(timeFmt))
+		}
+	}
+	if len(allTransfers) > 0 {
+		fmt.Fprintf(stdout, "转交记录（%d 次，按提交顺序；转交不计回执）:\n", len(allTransfers))
+		for i, tr := range allTransfers {
+			fmt.Fprintf(stdout, "  %d. 续接请求号: %s    去向批次: %s    新配送员: %s    原因: %s    时间: %s    本次集合（%d 件）:\n",
+				i+1, tr.Request, tr.ToBatch, tr.ToCourier, tr.Reason, tr.Time.Format(timeFmt), len(tr.Parcels))
+			for _, pid := range tr.Parcels {
+				fmt.Fprintf(stdout, "      - %s\n", pid)
+			}
 		}
 	}
 	if rvs := store.BatchRevokes(cleanIDVal); len(rvs) > 0 {
@@ -851,6 +865,8 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	to := fs.String("to", "", "新批次号（从未被出站或续接使用）")
 	courier := fs.String("courier", "", "新配送员（必须与原配送员不同）")
 	reason := fs.String("reason", "", "续接原因")
+	var parcels stringList
+	fs.Var(&parcels, "parcel", "包裹编号，可重复指定；指定后只转交这些待配送件，不指定则转交当时全部待配送件")
 	if ok, code := parseFlags(fs, argv, stdout, stderr, printRelayHelp); !ok {
 		return code
 	}
@@ -880,6 +896,15 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
 		return exitBusiness
 	}
+	// 不指定 --parcel 为不选成员方式（取当时全部待配送件）；指定则为显式集合。
+	var cleanParcels []string
+	if len(parcels) > 0 {
+		cleanParcels, err = cleanParcelList(parcels)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
+			return exitBusiness
+		}
+	}
 
 	store, release, err := OpenForUpdate(dataFile)
 	if err != nil {
@@ -887,7 +912,7 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		return exitBusiness
 	}
 	defer release()
-	res, replayed, err := store.Transfer(cleanReq, cleanFrom, cleanTo, cleanCourier, cleanReason, now())
+	res, replayed, err := store.Transfer(cleanReq, cleanFrom, cleanTo, cleanCourier, cleanReason, cleanParcels, now())
 	if err != nil {
 		fmt.Fprintf(stderr, "%s relay: %v\n", appName, err)
 		return exitBusiness
@@ -902,7 +927,11 @@ func cmdRelay(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	for _, id := range res.Parcels {
 		fmt.Fprintf(stdout, "  - %s\n", id)
 	}
-	fmt.Fprintf(stdout, "接手时间: %s\n", res.Time.Format(timeFmt))
+	mode := "不选成员（取当时全部待配送件）"
+	if res.Explicit {
+		mode = "显式选择"
+	}
+	fmt.Fprintf(stdout, "选择方式: %s\n接手时间: %s\n", mode, res.Time.Format(timeFmt))
 	return exitOK
 }
 

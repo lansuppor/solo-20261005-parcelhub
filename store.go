@@ -105,13 +105,48 @@ type BatchResult struct {
 	Receipts map[string]*ReceiptEntry `json:"receipts"` // 逐件回执，按包裹编号索引（未回执的包裹不在其中）
 	// AbortedBy 为中止该批次的中止请求号（未中止为空）；中止永久生效，批次不得复用。
 	AbortedBy string `json:"abortedBy,omitempty"`
-	// TransferredBy 为把该批次关闭为“已转交”的续接请求号（未转交为空）；
-	// 转交永久生效，与中止互斥，批次不得复用。
+	// TransferredBy 为把最后待配送件转走、永久关闭该批次为“已转交”的续接请求号
+	// （尚未永久转交为空）。途中分批续接期间该批次仍配送中，各次续接记录见 Transfers；
+	// 转走最后一件待配送件时才在此置位，与中止互斥，批次永久关闭、不得复用。
 	TransferredBy string `json:"transferredBy,omitempty"`
+	// Transfers 为该批次作为原批次发生过的各次续接的请求号，按提交顺序追加。
+	// 分批续接只转走部分待配送件：原批次保留件继续由原配送员按原批次配送，
+	// 故批次仍开放、仍可回执、中止或再次续接；旧版数据文件只有最后一次（整批）
+	// 续接的 transferredBy，载入时迁移到本列表。
+	Transfers []string `json:"transfers,omitempty"`
 	// RelayedFrom 与 RelayRequest 仅对续接创建的新批次有效：分别记录来源批次号
 	// 与创建本批次的续接请求号（普通出站批次为空）。
 	RelayedFrom  string `json:"relayedFrom,omitempty"`
 	RelayRequest string `json:"relayRequest,omitempty"`
+}
+
+// openParcels 返回该批次当前仍由本批次配送的待配送成员（无有效回执且未转交），
+// 按原成员顺序。载入校验保证 Transfers 引用的续接请求均存在。
+func (b *BatchResult) openParcels(ledger *ledgerFile) []string {
+	out := make([]string, 0, len(b.Parcels))
+	for _, pid := range b.Parcels {
+		if e, done := b.Receipts[pid]; done && e.RevokedBy == "" {
+			continue // 已有有效回执
+		}
+		transferred := false
+		for _, req := range b.Transfers {
+			if t := ledger.Transfers[req]; t != nil {
+				for _, id := range t.Parcels {
+					if id == pid {
+						transferred = true
+						break
+					}
+				}
+			}
+			if transferred {
+				break
+			}
+		}
+		if !transferred {
+			out = append(out, pid)
+		}
+	}
+	return out
 }
 
 // Effective 返回批次当前有效（未撤销）的回执数量。
@@ -176,11 +211,13 @@ type AbortResult struct {
 	Time    time.Time `json:"time"`    // 中止时间
 }
 
-// TransferResult 记录一次成功的配送途中整批续接，用于续接请求号去重与结果重放。
-// 续接表示原配送员把原批次全部尚未回执的包裹在配送途中交给另一配送员：
-// 新批次按原顺序接纳全部未回执件继续配送，包裹保持“配送中”及原站点，
-// 原批次永久关闭为“已转交”。续接请求号独立去重，可与批次号、包裹号及其他
-// 业务编号同名；失败的首次续接不占用请求号。
+// TransferResult 记录一次成功的配送途中续接，用于续接请求号去重与结果重放。
+// 续接表示原配送员把原批次部分或全部尚未回执的包裹在配送途中交给另一配送员：
+// 新批次按原成员顺序接纳本次选中件继续配送，包裹保持“配送中”及原站点；
+// 未选中的余件继续留在原批次由原配送员配送。只转交部分待配送件时原批次仍
+// 开放（仍配送中，可继续回执、中止或再次续接），转走最后一件待配送件时原批次
+// 才永久关闭为“已转交”。续接请求号独立去重，可与批次号、包裹号及其他业务
+// 编号同名；失败的首次续接不占用请求号。
 type TransferResult struct {
 	Request     string    `json:"request"`     // 续接请求号
 	FromBatch   string    `json:"fromBatch"`   // 原批次号
@@ -189,8 +226,12 @@ type TransferResult struct {
 	FromCourier string    `json:"fromCourier"` // 原配送员（取自原批次）
 	ToCourier   string    `json:"toCourier"`   // 新配送员
 	Reason      string    `json:"reason"`      // 清理后的续接原因
-	Parcels     []string  `json:"parcels"`     // 首次转交集合（原批次未回执成员，按原成员顺序）
+	Parcels     []string  `json:"parcels"`     // 本次转交集合，按原批次成员顺序
 	Time        time.Time `json:"time"`        // 接手时间
+	// Explicit 为 true 表示本次续接显式选择了包裹集合；false 表示不选成员、
+	// 取当时全部无有效回执且未转交的待配送件（旧版整批续接记录没有该字段，
+	// 按不选成员处理）。
+	Explicit bool `json:"explicit,omitempty"`
 }
 
 // RevokeResult 记录一次成功的误录回执撤销，用于撤销请求号去重与结果重放。
@@ -352,6 +393,17 @@ func Open(path string) (*Store, error) {
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
 			b.Receipts = map[string]*ReceiptEntry{}
+		}
+	}
+	// 早期版本的续接一次转走全部未回执件，原批次只用 transferredBy 记录最后一次
+	// （也是唯一一次）续接；现把它迁移到按提交顺序的 transfers 列表，旧有效台账
+	// 无需手工修改即可直接使用。
+	for _, b := range s.data.Batches {
+		if b == nil || len(b.Transfers) > 0 {
+			continue
+		}
+		if b.TransferredBy != "" {
+			b.Transfers = []string{b.TransferredBy}
 		}
 	}
 	if err := s.data.validate(); err != nil {
@@ -757,6 +809,44 @@ func (l *ledgerFile) validate() error {
 			if !ok || t == nil || t.FromBatch != id {
 				return fmt.Errorf("%w: 批次 %q 标记的续接请求号 %q 无法对应", ErrCorrupt, id, b.TransferredBy)
 			}
+			// 永久转交标记必须是按提交顺序的最后一次续接。
+			if len(b.Transfers) == 0 || b.Transfers[len(b.Transfers)-1] != b.TransferredBy {
+				return fmt.Errorf("%w: 批次 %q 的永久转交标记 %q 不在其按提交顺序的续接列表末尾", ErrCorrupt, id, b.TransferredBy)
+			}
+		}
+		// 各次续接：请求号均存在且源自本批次、不重复；同一件从同一批次不能重复转交；
+		// 转交件不能同时持有该批次的有效回执；永久转交时必须已无待配送件。
+		transferSeen := make(map[string]bool, len(b.Transfers))
+		transferMember := make(map[string]bool, len(b.Parcels))
+		for ti, req := range b.Transfers {
+			if transferSeen[req] {
+				return fmt.Errorf("%w: 批次 %q 的续接列表中请求号 %q 重复", ErrCorrupt, id, req)
+			}
+			transferSeen[req] = true
+			t, ok := l.Transfers[req]
+			if !ok || t == nil {
+				return fmt.Errorf("%w: 批次 %q 的第 %d 次续接引用了不存在的续接请求 %q", ErrCorrupt, id, ti+1, req)
+			}
+			if t.FromBatch != id {
+				return fmt.Errorf("%w: 续接请求 %q 属于原批次 %q，却列入批次 %q 的续接列表", ErrCorrupt, req, t.FromBatch, id)
+			}
+			for _, pid := range t.Parcels {
+				if !seen[pid] {
+					return fmt.Errorf("%w: 续接请求 %q 的包裹 %q 不属于原批次 %q", ErrCorrupt, req, pid, id)
+				}
+				if transferMember[pid] {
+					return fmt.Errorf("%w: 包裹 %q 在批次 %q 下被续接请求 %q 重复转交，同件从同批次只能转交一次",
+						ErrCorrupt, pid, id, req)
+				}
+				transferMember[pid] = true
+				if e, done := b.Receipts[pid]; done && e.RevokedBy == "" {
+					return fmt.Errorf("%w: 批次 %q 的包裹 %q 既有有效回执又被续接请求 %q 转交，二者互斥",
+						ErrCorrupt, id, pid, req)
+				}
+			}
+		}
+		if b.TransferredBy != "" && len(b.openParcels(l)) != 0 {
+			return fmt.Errorf("%w: 批次 %q 已永久转交，但仍有待配送件未转交", ErrCorrupt, id)
 		}
 		if b.RelayedFrom != "" {
 			t, ok := l.Transfers[b.RelayRequest]
@@ -836,9 +926,9 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 撤销请求号 %q 的包裹 %q 缺少对应的撤销回执轨迹", ErrCorrupt, req, rv.Parcel)
 		}
 	}
-	// 中止：收回集合必须恰为原批次的未回执成员（按原成员顺序，已撤销回执不计入
-	// 有效回执），且每件收回包裹的轨迹中都有与该中止请求一致的收回记录；
-	// 中止记录与收回轨迹不一致即损坏。
+	// 中止：收回集合必须恰为中止时仍由原批次配送的待配送成员（无有效回执且未在
+	// 此前各次续接中转交，按原成员顺序），且每件收回包裹的轨迹中都有与该中止
+	// 请求一致的收回记录；中止记录与收回轨迹不一致即损坏。
 	for req, a := range l.Aborts {
 		if a == nil || req != a.Request || a.Batch == "" || a.Station == "" || a.Reason == "" ||
 			len(a.Parcels) == 0 || a.Time.IsZero() {
@@ -851,15 +941,13 @@ func (l *ledgerFile) validate() error {
 		if b.AbortedBy != req {
 			return fmt.Errorf("%w: 中止请求号 %q 与批次 %q 的中止标记不一致", ErrCorrupt, req, a.Batch)
 		}
+		if b.TransferredBy != "" {
+			return fmt.Errorf("%w: 批次 %q 不能同时标记中止与永久转交", ErrCorrupt, a.Batch)
+		}
 		if a.Station != b.Station {
 			return fmt.Errorf("%w: 中止请求号 %q 的站点 %q 与批次 %q 出发站 %q 不一致", ErrCorrupt, req, a.Station, a.Batch, b.Station)
 		}
-		expect := make([]string, 0, len(b.Parcels))
-		for _, pid := range b.Parcels {
-			if e, done := b.Receipts[pid]; !done || e.RevokedBy != "" {
-				expect = append(expect, pid)
-			}
-		}
+		expect := b.openParcels(l)
 		if len(expect) != len(a.Parcels) {
 			return fmt.Errorf("%w: 中止请求号 %q 的收回集合与批次 %q 的未回执成员不一致", ErrCorrupt, req, a.Batch)
 		}
@@ -885,9 +973,12 @@ func (l *ledgerFile) validate() error {
 			}
 		}
 	}
-	// 续接：转交集合必须恰为原批次的未回执成员（按原成员顺序），新批次必须由该续接
-	// 创建且成员、站点、配送员、接手时间与之一致；每件转交包裹的轨迹中都有与该
-	// 续接请求一致的续接记录；续接记录与批次及轨迹不一致即损坏。
+	// 续接：每次续接必须由原批次按提交顺序的续接列表引用，新批次必须由该续接创建且
+	// 成员、站点、配送员、接手时间与之一致；本次转交集合必须非空、不重复、按原成员
+	// 顺序排列，且每件都属原批次、在该次续接之前未转交也无有效回执（同件从同批次
+	// 只能转交一次，已转交件不能回执原批次）；每件转交包裹的轨迹中都有与该续接
+	// 请求一致的续接记录。分批续接只转走部分待配送件，集合不必等于当时全部余件；
+	// 原批次永久转交（TransferredBy 置位）时必须已无待配送件。关联缺失或矛盾即损坏。
 	for req, t := range l.Transfers {
 		if t == nil || req != t.Request || t.FromBatch == "" || t.ToBatch == "" || t.Station == "" ||
 			t.FromCourier == "" || t.ToCourier == "" || t.FromCourier == t.ToCourier ||
@@ -898,8 +989,18 @@ func (l *ledgerFile) validate() error {
 		if !ok || fb == nil {
 			return fmt.Errorf("%w: 续接请求号 %q 引用了不存在的原批次 %q", ErrCorrupt, req, t.FromBatch)
 		}
-		if fb.TransferredBy != req {
-			return fmt.Errorf("%w: 续接请求号 %q 与原批次 %q 的转交标记不一致", ErrCorrupt, req, t.FromBatch)
+		idx := -1
+		for i, q := range fb.Transfers {
+			if q == req {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("%w: 续接请求号 %q 未列入原批次 %q 的续接列表，关联缺失", ErrCorrupt, req, t.FromBatch)
+		}
+		if fb.TransferredBy == req && idx != len(fb.Transfers)-1 {
+			return fmt.Errorf("%w: 续接请求号 %q 被标为原批次 %q 的永久转交，但不是其最后一次续接", ErrCorrupt, req, t.FromBatch)
 		}
 		if fb.Station != t.Station || fb.Courier != t.FromCourier {
 			return fmt.Errorf("%w: 续接请求号 %q 的站点或原配送员与原批次 %q 不一致", ErrCorrupt, req, t.FromBatch)
@@ -914,15 +1015,45 @@ func (l *ledgerFile) validate() error {
 		if nb.Station != t.Station || nb.Courier != t.ToCourier || !nb.Time.Equal(t.Time) {
 			return fmt.Errorf("%w: 续接请求号 %q 与新批次 %q 的站点、配送员或接手时间不一致", ErrCorrupt, req, t.ToBatch)
 		}
-		expect := make([]string, 0, len(fb.Parcels))
-		for _, pid := range fb.Parcels {
-			if e, done := fb.Receipts[pid]; !done || e.RevokedBy != "" {
-				expect = append(expect, pid)
+		// 该次续接之前各次已转交的成员。
+		prior := make(map[string]bool)
+		for _, q := range fb.Transfers[:idx] {
+			if pt := l.Transfers[q]; pt != nil {
+				for _, pid := range pt.Parcels {
+					prior[pid] = true
+				}
 			}
 		}
-		if !sameOrder(expect, t.Parcels) || !sameOrder(t.Parcels, nb.Parcels) {
-			return fmt.Errorf("%w: 续接请求号 %q 的转交集合与原批次 %q 的未回执成员或新批次 %q 的成员不一致",
-				ErrCorrupt, req, t.FromBatch, t.ToBatch)
+		memberPos := make(map[string]int, len(fb.Parcels))
+		for i, pid := range fb.Parcels {
+			memberPos[pid] = i
+		}
+		lastPos := -1
+		seenSel := make(map[string]bool, len(t.Parcels))
+		for _, pid := range t.Parcels {
+			pos, isMember := memberPos[pid]
+			if !isMember {
+				return fmt.Errorf("%w: 续接请求号 %q 的包裹 %q 不属于原批次 %q", ErrCorrupt, req, pid, t.FromBatch)
+			}
+			if seenSel[pid] {
+				return fmt.Errorf("%w: 续接请求号 %q 的转交集合中包裹 %q 重复", ErrCorrupt, req, pid)
+			}
+			seenSel[pid] = true
+			if pos <= lastPos {
+				return fmt.Errorf("%w: 续接请求号 %q 的转交集合顺序与原批次 %q 的成员顺序不一致", ErrCorrupt, req, t.FromBatch)
+			}
+			lastPos = pos
+			if prior[pid] {
+				return fmt.Errorf("%w: 续接请求号 %q 的包裹 %q 此前已从批次 %q 转交，同件从同批次只能转交一次",
+					ErrCorrupt, req, pid, t.FromBatch)
+			}
+			if e, done := fb.Receipts[pid]; done && e.RevokedBy == "" {
+				return fmt.Errorf("%w: 续接请求号 %q 的包裹 %q 在原批次 %q 已有有效回执，不能转交",
+					ErrCorrupt, req, pid, t.FromBatch)
+			}
+		}
+		if !sameOrder(t.Parcels, nb.Parcels) {
+			return fmt.Errorf("%w: 续接请求号 %q 的转交集合与新批次 %q 的成员不一致", ErrCorrupt, req, t.ToBatch)
 		}
 		for _, pid := range t.Parcels {
 			p, ok := l.Parcels[pid]
@@ -2026,21 +2157,22 @@ func (s *Store) Unfreeze(request, incident, note string, now time.Time) (res *Un
 	return res, false, nil
 }
 
-// Abort 中止一个配送批次：配送员已将该批次全部尚未回执的包裹实物收回出发站。
-// 成员与站点取自原批次结果，不允许另选成员或站点。
+// Abort 中止一个配送批次：配送员已将该批次仍由本批次配送的全部待配送包裹实物
+// 收回出发站。成员与站点取自原批次结果，不允许另选成员或站点。
 //
-// 首次中止：批次必须存在、尚未完成且未中止，且至少有一件未回执成员；这些成员
-// 必须仍在原批次配送中、归属出发站，任一不符整批拒绝、不作任何改动。已回执成员
-// 及其回执完全保留，即使它们已进入其他批次或被冻结也不阻止中止，不检查也不改变
-// 其当前状态。全部满足时按原成员顺序将全部未回执件恢复“在站”（站点为出发站），
-// 各追加一条含批次、中止请求号、原因、站点和时间的收回记录；收回不是失败回执，
-// 批次回执记录不变。中止永久关闭原批次，原成员顺序、配送员与出站时间保留不变。
+// 首次中止：批次必须存在、未中止、未永久转交，且至少有一件待配送成员（无有效
+// 回执且未在此前各次续接中转交）；这些成员必须仍在原批次配送中、归属出发站，
+// 任一不符整批拒绝、不作任何改动。已回执成员与已转交成员不检查也不变更，其后续
+// 流转或冻结不阻止中止。全部满足时按原成员顺序将全部待配送件恢复“在站”
+// （站点为出发站），各追加一条含批次、中止请求号、原因、站点和时间的收回记录；
+// 收回不是失败回执，批次回执记录与转交记录不变。中止永久关闭原批次，原成员顺序、
+// 配送员与出站时间保留不变。
 // 收回算新的流转，收回后不能退回出站前的旧交接；收回件可交接、冻结或再次出站，
 // 但不能首次回执旧批次（receipt 与 receipt-import 同样遵守）。
 // 中止请求号独立去重，可与批次号、包裹号及其他业务编号同名：相同请求号且批次、
 // 清理后的原因相同，直接返回首次收回集合与时间，replayed 为 true，不重新计算成员、
 // 不检查当前状态、不改写台账；请求号相同但批次或原因不同报冲突。
-// 每批只能成功中止一次：换请求号再中止或中止已正常完成的批次均拒绝；
+// 每批只能成功中止一次：换请求号再中止、中止已完成或已永久转交的批次均拒绝；
 // 失败的首次中止不占用请求号。
 func (s *Store) Abort(request, batch, reason string, now time.Time) (res *AbortResult, replayed bool, err error) {
 	if saved, ok := s.data.Aborts[request]; ok {
@@ -2059,21 +2191,13 @@ func (s *Store) Abort(request, batch, reason string, now time.Time) (res *AbortR
 		return nil, false, fmt.Errorf("中止失败：批次 %q 已中止（中止请求号 %q），每批只能成功中止一次", batch, b.AbortedBy)
 	}
 	if b.TransferredBy != "" {
-		return nil, false, fmt.Errorf("中止失败：批次 %q 已转交（续接请求号 %q），不能中止", batch, b.TransferredBy)
-	}
-	if b.Done() {
-		return nil, false, fmt.Errorf("中止失败：批次 %q 已全部回执完成，不能中止", batch)
+		return nil, false, fmt.Errorf("中止失败：批次 %q 已永久转交（续接请求号 %q），不能中止", batch, b.TransferredBy)
 	}
 
-	// 按原成员顺序挑出全部未回执成员（批次未完成，必至少有一件）。
-	recalled := make([]string, 0, len(b.Parcels)-len(b.Receipts))
-	for _, pid := range b.Parcels {
-		if e, done := b.Receipts[pid]; !done || e.RevokedBy != "" {
-			recalled = append(recalled, pid)
-		}
-	}
+	// 按原成员顺序挑出仍由本批次配送的待配送成员（无有效回执且未转交）。
+	recalled := b.openParcels(&s.data)
 	if len(recalled) == 0 {
-		return nil, false, fmt.Errorf("中止失败：批次 %q 没有未回执成员，不能中止", batch)
+		return nil, false, fmt.Errorf("中止失败：批次 %q 没有待配送成员，不能中止", batch)
 	}
 
 	// 先做全部校验：未回执成员必须仍在原批次配送中且归属出发站，任一不符整批拒绝。
@@ -2140,25 +2264,34 @@ func (s *Store) BatchAbort(batch string) *AbortResult {
 	return s.data.Aborts[b.AbortedBy]
 }
 
-// Transfer 把原批次全部尚未回执的包裹在配送途中整批交给另一配送员：
-// 新建批次继续配送，无需回站。成员与站点取自原批次，不允许另选成员或站点。
+// Transfer 在配送途中把原批次的部分或全部待配送包裹交给另一配送员，新建批次
+// 继续配送，无需回站。站点取自原批次，不可另选；成员可两种方式选择：parcels
+// 为 nil 表示不选成员，取当时全部无有效回执且未转交的待配送件；非 nil 为显式
+// 选择的非空、不重复集合（由调用方清洗）。
 //
-// 首次续接：原批次必须存在、仍开放（未中止、未转交）且有未回执成员；新批次号
-// 必须从未被出站或续接使用；新配送员必须与原配送员不同。未回执成员必须全部仍在
-// 原批次配送中且归属出发站，任一不符整批拒绝、不作任何改动。已回执成员不检查也
-// 不变更，其后续流转或冻结不阻止续接。全部满足时新批次按原成员顺序接纳全部未
-// 回执件，沿用出发站，记录新配送员及接手时间；包裹保持“配送中”及原站点，当前
-// 配送归属切换到新批次，各追加一条含请求号、前后批次、新配送员、站点、原因和
-// 时间的续接记录。原批次永久关闭为“已转交”，原成员、配送员、出站时间与真实
-// 回执保留不变；转交不算回执、收回或再次出站。续接算新的流转，续接后不能退回
-// 配送前的旧交接。
-// 续接请求号独立去重，可与批次号、包裹号及其他业务编号同名：相同请求号且原批次、
-// 新批次、新配送员、清理后的原因相同，直接返回首次转交集合、续接信息及时间，
-// replayed 为 true，不检查现状、不重算成员、不改写台账；请求号相同但内容不同报
-// 冲突；失败的首次续接不占用请求号。
-func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, now time.Time) (res *TransferResult, replayed bool, err error) {
+// 首次续接：原批次必须存在、未中止、未永久转交；新批次号必须从未被出站或续接
+// 使用；新配送员必须与原配送员不同。显式集合的每件选中件都必须属于原批次、
+// 无有效回执且未转交，并仍在该批次由出发站配送中；不选成员时本次集合为当时全部
+// 待配送件（它们同样必须仍在原批次配送中）。任一不符整次拒绝、不作任何改动。
+// 已有有效回执或已转交的成员不检查也不变更，其后续流转或冻结不阻止续接。
+// 成功时按原成员顺序以选中件创建新批次，沿用出发站，记录新配送员及接手时间；
+// 选中件保持“配送中”及原站点，当前配送归属切换到新批次，各追加一条含请求号、
+// 前后批次、新配送员、站点、原因和时间的续接记录；未选余件不变。原成员、配送员、
+// 出站时间与已有回执保留。原批次可多次分批续接：仍有待配送件时保持配送中；
+// 余件经回执办结时已完成（可按原条件撤销恢复配送）；续接转走最后一件待配送件时
+// 原批次才永久关闭为“已转交”。转交不算回执、收回或再次出站。续接算新的流转，
+// 续接后不能退回配送前的旧交接。
+// 两种选择方式共用续接请求号去重范围，可与批次号、包裹号及其他业务编号同名：
+// 相同请求号且原批次、新批次、新配送员、清理后的原因、选择方式相同（显式集合
+// 换序无关），直接返回首次转交集合、续接信息及时间，replayed 为 true，不检查
+// 现状、不重算余件、不追加轨迹、不改写台账（后续回执、中止或再次续接后仍成立）；
+// 请求号相同但内容或选择方式不同报冲突；失败的首次续接不占用请求号。
+func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, parcels []string, now time.Time) (res *TransferResult, replayed bool, err error) {
+	explicit := parcels != nil
 	if saved, ok := s.data.Transfers[request]; ok {
-		if saved.FromBatch == fromBatch && saved.ToBatch == toBatch && saved.ToCourier == courier && saved.Reason == reason {
+		if saved.FromBatch == fromBatch && saved.ToBatch == toBatch && saved.ToCourier == courier &&
+			saved.Reason == reason && saved.Explicit == explicit &&
+			(!explicit || sameSet(saved.Parcels, parcels)) {
 			return saved, true, nil
 		}
 		return nil, false, fmt.Errorf("续接请求号 %q 已用于一次不同的续接（原批次=%q 新批次=%q 新配送员=%q），内容冲突",
@@ -2173,7 +2306,7 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 		return nil, false, fmt.Errorf("续接失败：批次 %q 已中止（中止请求号 %q），不能续接", fromBatch, b.AbortedBy)
 	}
 	if b.TransferredBy != "" {
-		return nil, false, fmt.Errorf("续接失败：批次 %q 已转交（续接请求号 %q），不能再次续接", fromBatch, b.TransferredBy)
+		return nil, false, fmt.Errorf("续接失败：批次 %q 已永久转交（续接请求号 %q），不能再次续接", fromBatch, b.TransferredBy)
 	}
 	if _, used := s.data.Batches[toBatch]; used {
 		return nil, false, fmt.Errorf("续接失败：新批次号 %q 已被出站或续接使用，不能复用", toBatch)
@@ -2182,22 +2315,55 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 		return nil, false, fmt.Errorf("续接失败：新配送员 %q 不能与原批次 %q 的配送员相同", courier, fromBatch)
 	}
 
-	// 按原成员顺序挑出全部未回执成员（批次仍开放，必至少有一件）。
-	moved := make([]string, 0, len(b.Parcels)-len(b.Receipts))
-	for _, pid := range b.Parcels {
-		if e, done := b.Receipts[pid]; !done || e.RevokedBy != "" {
-			moved = append(moved, pid)
+	// 本次集合：显式方式校验指定集合，不选方式取当时全部待配送件；均按原成员顺序。
+	open := b.openParcels(&s.data)
+	openSet := make(map[string]bool, len(open))
+	for _, pid := range open {
+		openSet[pid] = true
+	}
+	var moved []string
+	if explicit {
+		if len(parcels) == 0 {
+			return nil, false, fmt.Errorf("续接失败：显式选择的包裹集合不可为空，整次续接未执行")
+		}
+		want := make(map[string]bool, len(parcels))
+		for _, pid := range parcels {
+			if want[pid] {
+				return nil, false, fmt.Errorf("续接失败：显式集合中包裹 %q 重复，整次续接未执行", pid)
+			}
+			want[pid] = true
+			if !openSet[pid] {
+				// 区分不属于批次、已有有效回执/已转交等情形，给出明确原因。
+				member := false
+				for _, mid := range b.Parcels {
+					if mid == pid {
+						member = true
+						break
+					}
+				}
+				if !member {
+					return nil, false, fmt.Errorf("续接失败：包裹 %q 不属于原批次 %q，整次续接未执行", pid, fromBatch)
+				}
+				return nil, false, fmt.Errorf("续接失败：包裹 %q 在批次 %q 已有有效回执或已转交，不能再次选中，整次续接未执行", pid, fromBatch)
+			}
+		}
+		for _, pid := range b.Parcels {
+			if want[pid] {
+				moved = append(moved, pid)
+			}
+		}
+	} else {
+		moved = append(moved, open...)
+		if len(moved) == 0 {
+			return nil, false, fmt.Errorf("续接失败：批次 %q 没有待配送成员，不能续接", fromBatch)
 		}
 	}
-	if len(moved) == 0 {
-		return nil, false, fmt.Errorf("续接失败：批次 %q 没有未回执成员，不能续接", fromBatch)
-	}
 
-	// 先做全部校验：未回执成员必须仍在原批次配送中且归属出发站，任一不符整批拒绝。
+	// 先做全部校验：选中件必须仍在原批次由出发站配送中，任一不符整次拒绝。
 	for _, pid := range moved {
 		p := s.data.Parcels[pid] // 批次成员必已登记（载入校验保证）
 		if p.Status != statusDelivering || currentBatch(p) != fromBatch || p.Station != b.Station {
-			return nil, false, fmt.Errorf("续接失败：包裹 %q 当前归属 %q、状态 %q，不在批次 %q 从出发站 %q 配送中，整批续接未执行",
+			return nil, false, fmt.Errorf("续接失败：包裹 %q 当前归属 %q、状态 %q，不在批次 %q 从出发站 %q 配送中，整次续接未执行",
 				pid, p.Station, p.Status, fromBatch, b.Station)
 		}
 	}
@@ -2212,6 +2378,7 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 		Reason:      reason,
 		Parcels:     append([]string(nil), moved...),
 		Time:        now,
+		Explicit:    explicit,
 	}
 	s.data.Transfers[request] = res
 	s.data.Batches[toBatch] = &BatchResult{
@@ -2224,7 +2391,11 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 		RelayedFrom:  fromBatch,
 		RelayRequest: request,
 	}
-	b.TransferredBy = request
+	b.Transfers = append(b.Transfers, request)
+	// 转走最后一件待配送件：原批次永久关闭为“已转交”；有余件则保持配送中。
+	if len(b.openParcels(&s.data)) == 0 {
+		b.TransferredBy = request
+	}
 
 	// 记录旧值，落盘失败时整体回滚。包裹保持“配送中”及原站点，只追加续接轨迹。
 	prev := make(map[string][]Event, len(moved))
@@ -2246,6 +2417,7 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 	if err := s.save(); err != nil {
 		delete(s.data.Transfers, request)
 		delete(s.data.Batches, toBatch)
+		b.Transfers = b.Transfers[:len(b.Transfers)-1]
 		b.TransferredBy = ""
 		for pid, old := range prev {
 			s.data.Parcels[pid].Trail = old
@@ -2255,13 +2427,50 @@ func (s *Store) Transfer(request, fromBatch, toBatch, courier, reason string, no
 	return res, false, nil
 }
 
-// BatchTransferSource 返回以该批次为原批次的续接结果；批次不存在或未转交时返回 nil。
+// BatchTransferSource 返回永久关闭该批次为“已转交”的最后一次续接结果；
+// 批次不存在或仍开放（尚未永久转交）时返回 nil。
 func (s *Store) BatchTransferSource(batch string) *TransferResult {
 	b, ok := s.data.Batches[batch]
 	if !ok || b.TransferredBy == "" {
 		return nil
 	}
 	return s.data.Transfers[b.TransferredBy]
+}
+
+// BatchTransfers 按提交顺序返回以该批次为原批次的各次续接结果；
+// 批次不存在或从未续接时为空。分批续接时可能含多条，最后一条未必永久关闭原批次。
+func (s *Store) BatchTransfers(batch string) []*TransferResult {
+	b, ok := s.data.Batches[batch]
+	if !ok {
+		return nil
+	}
+	out := make([]*TransferResult, 0, len(b.Transfers))
+	for _, req := range b.Transfers {
+		if t := s.data.Transfers[req]; t != nil {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// transferOfParcel 返回某成员在指定批次下被转交的续接结果；该件未从该批次转交时为 nil。
+func (s *Store) transferOfParcel(batch, pid string) *TransferResult {
+	b, ok := s.data.Batches[batch]
+	if !ok {
+		return nil
+	}
+	for _, req := range b.Transfers {
+		t := s.data.Transfers[req]
+		if t == nil {
+			continue
+		}
+		for _, id := range t.Parcels {
+			if id == pid {
+				return t
+			}
+		}
+	}
+	return nil
 }
 
 // TransferOf 按续接请求号返回续接结果；不存在时返回 nil。
@@ -2732,6 +2941,9 @@ func (s *Store) BatchQuery(batch string) (*BatchResult, error) {
 	}
 	return b, nil
 }
+
+// batchOpen 返回批次当前仍由本批次配送的待配送成员（无有效回执且未转交），按原成员顺序。
+func (s *Store) batchOpen(b *BatchResult) []string { return b.openParcels(&s.data) }
 
 // sameOrder 判断两个列表长度与逐元素顺序完全一致。
 func sameOrder(a, b []string) bool {
