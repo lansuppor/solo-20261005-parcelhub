@@ -208,7 +208,7 @@ func TestRevokeReceiptBatchClosed(t *testing.T) {
 
 	s2, _ := openTempStore(t)
 	setupRelayBase(t, s2) // P001 已以 RC1 签收
-	if _, _, err := s2.Transfer("T1", "B1", "B2", "李四", "原配送员车辆故障", tClock(2026, 10, 5, 11, 0)); err != nil {
+	if _, _, err := s2.Transfer("T1", "B1", "B2", "李四", "原配送员车辆故障", nil, tClock(2026, 10, 5, 11, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s2.RevokeReceipt("RV1", "RC1", "原因", tClock(2026, 10, 5, 12, 0)); err == nil ||
@@ -261,7 +261,7 @@ func TestRevokeThenReReceiptAndAbort(t *testing.T) {
 	setupRevokeBase(t, s3)
 	mustReceiptOK(t, s3, "RC1", "B1", "P001", resultSigned, "", tClock(2026, 10, 5, 10, 0))
 	mustRevoke(t, s3, "RV1", "RC1", "误录签收", tClock(2026, 10, 5, 11, 0))
-	tr, _, err := s3.Transfer("T1", "B1", "B2", "李四", "原配送员车辆故障", tClock(2026, 10, 5, 12, 0))
+	tr, _, err := s3.Transfer("T1", "B1", "B2", "李四", "原配送员车辆故障", nil, tClock(2026, 10, 5, 12, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

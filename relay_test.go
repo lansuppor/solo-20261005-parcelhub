@@ -10,7 +10,7 @@ import (
 
 func mustTransfer(t *testing.T, s *Store, request, fromBatch, toBatch, courier, reason string, now time.Time) *TransferResult {
 	t.Helper()
-	res, replayed, err := s.Transfer(request, fromBatch, toBatch, courier, reason, now)
+	res, replayed, err := s.Transfer(request, fromBatch, toBatch, courier, reason, nil, now)
 	if err != nil || replayed {
 		t.Fatalf("Transfer(%q) 意外失败: %v replayed=%v", request, err, replayed)
 	}
@@ -109,7 +109,7 @@ func TestTransferReplayAndConflict(t *testing.T) {
 
 	// 同号同内容重放：返回首次集合、续接信息及时间，不检查现状、不重算成员、不改写台账。
 	before, _ := os.ReadFile(s.path)
-	got, replayed, err := s.Transfer("T1", "B1", "B2", "李四", "车辆故障", tClock(2026, 10, 5, 14, 0))
+	got, replayed, err := s.Transfer("T1", "B1", "B2", "李四", "车辆故障", nil, tClock(2026, 10, 5, 14, 0))
 	if err != nil || !replayed || got != first {
 		t.Fatalf("同内容重放应返回首次结果: replayed=%v err=%v got=%+v", replayed, err, got)
 	}
@@ -128,7 +128,7 @@ func TestTransferReplayAndConflict(t *testing.T) {
 		{"B1", "B2", "王五", "车辆故障"},
 		{"B1", "B2", "李四", "别的原因"},
 	} {
-		if _, _, err := s.Transfer("T1", c.from, c.to, c.courier, c.reason, tClock(2026, 10, 5, 15, 0)); err == nil {
+		if _, _, err := s.Transfer("T1", c.from, c.to, c.courier, c.reason, nil, tClock(2026, 10, 5, 15, 0)); err == nil {
 			t.Fatalf("换内容应报冲突: %+v", c)
 		}
 	}
@@ -169,7 +169,7 @@ func TestTransferFailuresAtomic(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, _, err := s.Transfer(c.request, c.from, c.to, c.courier, c.reason, now); err == nil {
+			if _, _, err := s.Transfer(c.request, c.from, c.to, c.courier, c.reason, nil, now); err == nil {
 				t.Fatal("条件不满足时续接必须失败")
 			}
 			after, _ := os.ReadFile(path)
@@ -187,7 +187,7 @@ func TestTransferFailuresAtomic(t *testing.T) {
 	p2 := s.data.Parcels["P002"]
 	oldStatus := p2.Status
 	p2.Status = statusInStation
-	if _, _, err := s.Transfer("T8", "B7", "B10", "王五", "原因", now); err == nil {
+	if _, _, err := s.Transfer("T8", "B7", "B10", "王五", "原因", nil, now); err == nil {
 		t.Fatal("未回执件不在原批次配送中时必须整批拒绝")
 	}
 	p2.Status = oldStatus
@@ -237,7 +237,7 @@ func TestTransferBlocksOldBatch(t *testing.T) {
 	if _, _, err := s.Abort("A1", "B1", "原因", now); err == nil {
 		t.Fatal("已转交批次不能中止")
 	}
-	if _, _, err := s.Transfer("T2", "B1", "B3", "王五", "原因", now); err == nil {
+	if _, _, err := s.Transfer("T2", "B1", "B3", "王五", "原因", nil, now); err == nil {
 		t.Fatal("已转交批次不能再次续接")
 	}
 
@@ -313,7 +313,7 @@ func TestTransferPersistenceAndCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重开台账失败: %v", err)
 	}
-	if got, replayed, err := s2.Transfer("T1", "B1", "B2", "李四", "车辆故障", tClock(2026, 10, 5, 12, 0)); err != nil || !replayed ||
+	if got, replayed, err := s2.Transfer("T1", "B1", "B2", "李四", "车辆故障", nil, tClock(2026, 10, 5, 12, 0)); err != nil || !replayed ||
 		got.ToCourier != "李四" || len(got.Parcels) != 2 {
 		t.Fatalf("重启后重放应返回首次结果: replayed=%v err=%v got=%+v", replayed, err, got)
 	}
