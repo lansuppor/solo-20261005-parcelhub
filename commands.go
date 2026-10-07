@@ -116,7 +116,11 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if sh := store.ActiveShipment(cleanIDVal); sh != nil {
-		fmt.Fprintf(stdout, "当前运输单: %s\n目的站: %s\n", sh.Shipment, sh.To)
+		eff := store.effectiveTo(sh)
+		fmt.Fprintf(stdout, "当前运输单: %s\n当前有效目的站: %s\n", sh.Shipment, eff)
+		if eff != sh.To {
+			fmt.Fprintf(stdout, "原目的站: %s\n", sh.To)
+		}
 	}
 	if f := store.ActiveFreeze(cleanIDVal); f != nil {
 		fmt.Fprintf(stdout, "当前未解除异常: 异常单号: %s    原因: %s    冻结时间: %s\n",
@@ -164,6 +168,9 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		case "接收":
 			fmt.Fprintf(stdout, "  %d. 操作: 接收    源站: %s    目的站: %s    运输单号: %s    接收请求号: %s    时间: %s\n",
 				i+1, e.From, e.To, e.Shipment, e.Request, e.Time.Format(timeFmt))
+		case "改址":
+			fmt.Fprintf(stdout, "  %d. 操作: 改址    运输单号: %s    原目的站: %s    新目的站: %s    改址请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Shipment, e.From, e.To, e.Request, e.Reason, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -1075,6 +1082,69 @@ func cmdReceive(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
+func cmdReroute(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("reroute", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "改址请求号（独立去重）")
+	shipment := fs.String("shipment", "", "要改址的运输单号")
+	expect := fs.String("expect", "", "预期当前目的站（必须等于当前有效目的站）")
+	to := fs.String("to", "", "新目的站（不同于当前有效目的站和源站）")
+	reason := fs.String("reason", "", "改址原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printRerouteHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("改址请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanShipment, err := cleanID("运输单号", *shipment)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanExpect, err := cleanID("预期当前目的站", *expect)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanTo, err := cleanID("新目的站", *to)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("改址原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	res, replayed, err := store.Reroute(cleanReq, cleanShipment, cleanExpect, cleanTo, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s reroute: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "改址成功"
+	if replayed {
+		headline = "改址成功（改址请求号重复提交，返回首次保存的结果，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n改址请求号: %s\n运输单号: %s\n原目的站: %s\n新目的站: %s\n改址原因: %s\n本次改址（%d 件）:\n",
+		headline, res.Request, res.Shipment, res.From, res.To, res.Reason, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
 func cmdShipment(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("shipment", stderr)
 	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
@@ -1112,17 +1182,28 @@ func cmdShipment(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	} else if received > 0 {
 		status = "部分接收"
 	}
-	fmt.Fprintf(stdout, "运输单号: %s\n源站点: %s\n目的站点: %s\n运输单状态: %s\n接收进度: %d/%d 已接收\n成员（%d 件）:\n",
-		sh.Shipment, sh.From, sh.To, status, received, len(sh.Parcels), len(sh.Parcels))
+	eff := store.effectiveTo(sh)
+	fmt.Fprintf(stdout, "运输单号: %s\n源站点: %s\n目的站点: %s\n当前有效目的站: %s\n运输单状态: %s\n接收进度: %d/%d 已接收\n成员（%d 件）:\n",
+		sh.Shipment, sh.From, sh.To, eff, status, received, len(sh.Parcels), len(sh.Parcels))
 	for _, pid := range sh.Parcels {
 		if rv := store.ShipmentReceiveOf(cleanIDVal, pid); rv != nil {
-			fmt.Fprintf(stdout, "  - %s    已接收    接收请求号: %s    接收时间: %s\n",
-				pid, rv.Request, rv.Time.Format(timeFmt))
+			fmt.Fprintf(stdout, "  - %s    已接收    接收请求号: %s    接收时间: %s    接收站点: %s\n",
+				pid, rv.Request, rv.Time.Format(timeFmt), rv.Station)
 		} else {
 			fmt.Fprintf(stdout, "  - %s    待接收（站间在途）\n", pid)
 		}
 	}
 	fmt.Fprintf(stdout, "发运时间: %s\n", sh.Time.Format(timeFmt))
+	if rrs := store.ShipmentReroutes(cleanIDVal); len(rrs) > 0 {
+		fmt.Fprintf(stdout, "改址记录（%d 次，按提交顺序）:\n", len(rrs))
+		for i, r := range rrs {
+			fmt.Fprintf(stdout, "  %d. 改址请求号: %s    原目的站: %s    新目的站: %s    原因: %s    时间: %s    本次集合（%d 件）:\n",
+				i+1, r.Request, r.From, r.To, r.Reason, r.Time.Format(timeFmt), len(r.Parcels))
+			for _, pid := range r.Parcels {
+				fmt.Fprintf(stdout, "      - %s\n", pid)
+			}
+		}
+	}
 	if sh.ReceivedBy != "" {
 		rv := store.ReceiveOf(sh.ReceivedBy)
 		fmt.Fprintf(stdout, "接收请求号: %s\n接收站点: %s\n接收时间: %s\n",
