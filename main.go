@@ -104,6 +104,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdShip(dataFile, rest[1:], stdout, stderr)
 	case "receive":
 		return cmdReceive(dataFile, rest[1:], stdout, stderr)
+	case "reroute":
+		return cmdReroute(dataFile, rest[1:], stdout, stderr)
 	case "shipment":
 		return cmdShipment(dataFile, rest[1:], stdout, stderr)
 	default:
@@ -148,6 +150,7 @@ func printHelp(w io.Writer) {
   relay                  配送途中整批续接：原批次未回执包裹交给另一配送员，新建批次继续配送
   ship                   站间发运：整单包裹离开源站、转为“站间在途”，归属站点暂记源站
   receive                到站接收：可指定未到包裹集合，也可不选、接收全部尚未接收件
+  reroute                运输途中改址：将运输单当前全部未收件改送另一目的站，不另建运输单
   shipment               按运输单号查询两站、原成员、接收进度与各已收件的接收信息
 
 常用示例:
@@ -170,6 +173,7 @@ func printHelp(w io.Writer) {
   %s ship     --shipment S1 --from 站点A --to 站点B \
               --parcel P001 --parcel P002
   %s receive  --request RS1 --shipment S1 --station 站点B
+  %s reroute  --request RR1 --shipment S1 --expect 站点B --to 站点C --reason 目的站停收
   %s shipment --id S1
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
@@ -180,7 +184,7 @@ func printHelp(w io.Writer) {
 与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch 每次读取
 一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
 终止）自动释放，无需人工删除协调文件（<数据文件>.lock）。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -207,7 +211,7 @@ func printQueryHelp(w io.Writer) {
 
 展示当前站点、当前状态、当前未解除异常（若有）及按提交顺序排列的完整轨迹；
 配送中包裹同时展示当前批次与当前配送员；站间在途包裹同时展示当前运输单号
-与目的站。
+与当前有效目的站（运输途中改址后为新目的站）。
 交接记录同时显示请求号；退回记录同时显示源站、目的站、
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
@@ -217,7 +221,8 @@ func printQueryHelp(w io.Writer) {
 新配送员、续接请求号、原因、站点和时间；撤销回执记录显示批次号、
 撤销请求号、原回执请求号、原因、站点和时间，已被撤销的回执记录
 同时标注撤销状态；发运记录显示运输单号、源站、目的站和时间；
-接收记录显示运输单号、接收请求号、源站、目的站和时间。
+接收记录显示运输单号、接收请求号、源站、目的站和时间；
+改址记录显示运输单号、改址请求号、前后目的站、原因和时间。
 包裹不存在时报错，不会创建记录。
 
 示例:
@@ -558,7 +563,8 @@ func printReceiveHelp(w io.Writer) {
   - 接收请求号、运输单号、接收站点均去除两端空白，不可为空或仅含空白
   - 两种选择方式：指定 --parcel 为显式集合（非空、不重复），只接收这些未到件；
     不指定 --parcel 则不选成员，接收当时全部尚未接收件
-  - 首次接收：运输单必须存在，接收站点必须等于运输单目的站，本次至少接收一件；
+  - 首次接收：运输单必须存在，接收站点必须等于受理时的当前有效目的站
+    （运输途中改址后可能不同于原目的站），本次至少接收一件；
     显式集合的每件选中件都必须属于原单、尚未接收，且仍在源站归该单在途；
     任一不满足则整次拒绝，不作任何改动
   - 已收件不再检查接收条件也不变更，其后续交接、冻结、配送或再次发运不妨碍余件接收
@@ -579,17 +585,50 @@ func printReceiveHelp(w io.Writer) {
 `, appName, appName, appName, appName)
 }
 
+func printRerouteHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s reroute — 运输途中改址（运输单当前全部未收件改送另一目的站，不另建运输单、不重新发运）
+
+用法:
+  %s reroute [--data FILE] --request 改址请求号 --shipment 运输单号 \
+             --expect 预期当前目的站 --to 新目的站 --reason 改址原因
+
+规则:
+  - 改址请求号、运输单号、预期当前目的站、新目的站、改址原因均去除两端空白，不可为空或仅含空白
+  - 成员与前后站点取自运输单当前状态，不允许另选包裹
+  - 首次受理：运输单必须存在且仍有未收件；预期目的站必须等于当前有效目的站；
+    新目的站必须不同于当前目的站和源站；受理时全部未收件必须仍归该单
+    在源站站间在途，任一不符整次拒绝、不作任何改动
+  - 已收件不参与受理条件检查或变更，其后续合法作业不阻止改址
+  - 成功时按原发运顺序保存本次集合并逐件追加改址轨迹；成员仍归源站、
+    保持站间在途及作业限制，只变更余件的有效目的站；原成员、发运结果、
+    已有接收事实与轨迹永久保留。改址不算到站、不恢复旧交接退回资格
+  - 允许再次改址，每次以当时余件为准；全部接收后拒绝新改址；
+    此后 receive 按新的有效目的站接收
+  - 改址请求号独立去重，可与运输单号及其他业务编号同名：
+    相同请求号且运输单、预期目的站、新目的站、清理后的原因相同，
+    直接返回首次改址信息、集合与时间，不检查现状、不重算余件、不改写台账
+    （再次改址、接收和后续流转后仍成立）；请求号相同但内容不同报冲突；
+    失败的首次改址不占用请求号
+
+示例:
+  %s reroute --request RR1 --shipment S1 --expect 站点B --to 站点C --reason 目的站停收
+`, appName, appName, appName)
+}
+
 func printShipmentHelp(w io.Writer) {
 	fmt.Fprintf(w, `%s shipment — 按运输单号查询站间运输单
 
 用法:
   %s shipment [--data FILE] --id 运输单号
 
-展示源站、目的站、原成员（按首次提交顺序）、运输单状态
-（待接收 / 部分接收 / 已接收，按该单各次接收事实统计）、接收进度、
-发运时间；按原顺序区分已收和未收成员，各已收件同时展示接收请求号与
-接收时间，未收件标注为待接收（站间在途）；全部接收的运输单同时展示
-完成接收的请求号、接收站点与接收时间。运输单不存在时报错。
+展示源站、原目的站与当前有效目的站（运输途中改址后为新目的站）、
+原成员（按首次提交顺序）、运输单状态（待接收 / 部分接收 / 已接收，
+按该单各次接收事实统计）、接收进度、发运时间；按原顺序区分已收和
+未收成员，各已收件同时展示接收请求号、实际接收站与接收时间，
+未收件标注为待接收（站间在途）；发生过改址时按提交顺序列出改址记录
+（改址请求号、前后目的站、原因、时间）及每次对应的包裹集合；
+全部接收的运输单同时展示完成接收的请求号、接收站点与接收时间。
+运输单不存在时报错。
 
 示例:
   %s shipment --id S1
