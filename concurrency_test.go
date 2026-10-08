@@ -224,6 +224,77 @@ func TestConcurrentReceiptsSameBatch(t *testing.T) {
 	}
 }
 
+// 同一签收同时办理实物退件与撤销：竞争至多一方成功；另一方以状态码 1 退出
+// 且不占用编号。反复多次以覆盖两种胜出顺序。
+func TestConcurrentReceiptReturnVsRevoke(t *testing.T) {
+	for iter := 0; iter < 6; iter++ {
+		dbPath := filepath.Join(t.TempDir(), "ledger.json")
+		if _, _, code := runCLI(t, dbPath, "register", "--id", "P001", "--station", "站点A"); code != 0 {
+			t.Fatalf("登记失败")
+		}
+		if _, _, code := runCLI(t, dbPath, "dispatch", "--batch", "B1",
+			"--station", "站点A", "--courier", "张三", "--parcel", "P001"); code != 0 {
+			t.Fatalf("出站失败")
+		}
+		if _, _, code := runCLI(t, dbPath, "receipt", "--request", "RC1",
+			"--batch", "B1", "--parcel", "P001", "--result", "签收"); code != 0 {
+			t.Fatalf("签收失败")
+		}
+		_, errs, codes := runParallel(t, 2, func(i int) []string {
+			if i == 0 {
+				return []string{"--data", dbPath, "receipt-return", "--request", "RR1",
+					"--receipt", "RC1", "--reason", "客户退货"}
+			}
+			return []string{"--data", dbPath, "receipt-revoke", "--request", "RV1",
+				"--receipt", "RC1", "--reason", "误录签收"}
+		})
+		if got := countCodes(codes, exitOK); got != 1 {
+			t.Fatalf("第 %d 轮：退件与撤销应恰好一方成功，成功 %d 次（codes=%v errs=%v）", iter, got, codes, errs)
+		}
+
+		s, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("打开台账失败: %v", err)
+		}
+		p, _ := s.Query("P001")
+		switch {
+		case codes[0] == exitOK:
+			// 退件胜出：包裹在站、末条退件轨迹；签收未撤销且标记退件；撤销号不占。
+			if p.Status != statusInStation || p.Station != "站点A" {
+				t.Fatalf("第 %d 轮：退件胜出后应在站: %+v", iter, p)
+			}
+			if p.Trail[len(p.Trail)-1].Op != "退件" {
+				t.Fatalf("第 %d 轮：退件胜出后末条应为退件: %+v", iter, p.Trail)
+			}
+			rc := s.ReceiptOf("RC1")
+			if rc.RevokedBy != "" || rc.ReturnedBy != "RR1" {
+				t.Fatalf("第 %d 轮：退件胜出后签收应标记退件未撤销: %+v", iter, rc)
+			}
+			if s.data.Revokes["RV1"] != nil {
+				t.Fatalf("第 %d 轮：失败的撤销不得占用 RV1", iter)
+			}
+			if _, _, err := s.RevokeReceipt("RV1", "RC1", "误录签收", tClock(2026, 10, 5, 12, 0)); err == nil {
+				t.Fatalf("第 %d 轮：退件胜出后再次撤销仍应拒绝", iter)
+			}
+		default:
+			// 撤销胜出：包裹配送中、末条撤销轨迹；退件号不占。
+			if p.Status != statusDelivering || p.Station != "站点A" {
+				t.Fatalf("第 %d 轮：撤销胜出后应恢复配送中: %+v", iter, p)
+			}
+			if p.Trail[len(p.Trail)-1].Op != "撤销回执" {
+				t.Fatalf("第 %d 轮：撤销胜出后末条应为撤销回执: %+v", iter, p.Trail)
+			}
+			rc := s.ReceiptOf("RC1")
+			if rc.ReturnedBy != "" || rc.RevokedBy != "RV1" {
+				t.Fatalf("第 %d 轮：撤销胜出后签收应标记撤销无退件: %+v", iter, rc)
+			}
+			if s.data.ReceiptReturns["RR1"] != nil {
+				t.Fatalf("第 %d 轮：失败的退件不得占用 RR1", iter)
+			}
+		}
+	}
+}
+
 // 同一路径的相对、绝对及含 .、.. 的写法须归一到同一协调文件。
 func TestCoordinationPathForms(t *testing.T) {
 	dir := t.TempDir()

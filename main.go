@@ -90,6 +90,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReceiptImport(dataFile, rest[1:], stdout, stderr)
 	case "receipt-revoke":
 		return cmdReceiptRevoke(dataFile, rest[1:], stdout, stderr)
+	case "receipt-return":
+		return cmdReceiptReturn(dataFile, rest[1:], stdout, stderr)
 	case "batch":
 		return cmdBatch(dataFile, rest[1:], stdout, stderr)
 	case "freeze":
@@ -143,6 +145,7 @@ func printHelp(w io.Writer) {
   receipt                逐件回执：签收或失败（失败须给原因）；全部回执后批次自动完成
   receipt-import         从本地文件整批导入回执：全部可接受才整体生效，任一不符整份拒绝
   receipt-revoke         撤销误录回执：包裹实际仍由原配送员配送，该件恢复原批次配送中
+  receipt-return         签收后实物退件：已真实签收包裹送回该次配送出发站，恢复在站
   batch                  按批次号查询成员、配送员、出站时间与逐件回执进度
   freeze                 在站包裹异常冻结：禁止交接、配送出站与整批退回
   unfreeze               解除异常冻结：原站恢复在站；异常单永久标记为已解除
@@ -165,6 +168,7 @@ func printHelp(w io.Writer) {
   %s receipt  --request RC2 --batch B1 --parcel P002 --result 失败 --reason 收件人不在
   %s receipt-import --file receipts.json
   %s receipt-revoke --request RV1 --receipt RC2 --reason 误录失败，实际仍配送中
+  %s receipt-return --request RR1 --receipt RC1 --reason 签收后申请退货，实物送回
   %s batch    --id B1
   %s freeze   --incident E1 --parcel P001 --station 站点A --reason 外包装破损
   %s unfreeze --request U1 --incident E1 --note 已核实放行
@@ -184,7 +188,7 @@ func printHelp(w io.Writer) {
 与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch 每次读取
 一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
 终止）自动释放，无需人工删除协调文件（<数据文件>.lock）。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -220,7 +224,8 @@ func printQueryHelp(w io.Writer) {
 中止请求号、原因、站点和时间；续接记录显示原批次号、新批次号、
 新配送员、续接请求号、原因、站点和时间；撤销回执记录显示批次号、
 撤销请求号、原回执请求号、原因、站点和时间，已被撤销的回执记录
-同时标注撤销状态；发运记录显示运输单号、源站、目的站和时间；
+同时标注撤销状态；退件记录显示批次号、接收站、退件请求号、原签收
+请求号、原因和时间；发运记录显示运输单号、源站、目的站和时间；
 接收记录显示运输单号、接收请求号、源站、目的站和时间；
 改址记录显示运输单号、改址请求号、前后目的站、原因和时间。
 包裹不存在时报错，不会创建记录。
@@ -393,6 +398,34 @@ func printReceiptRevokeHelp(w io.Writer) {
 `, appName, appName, appName)
 }
 
+func printReceiptReturnHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s receipt-return — 签收后实物退件（已真实签收的包裹送回该次配送出发站）
+
+用法:
+  %s receipt-return [--data FILE] --request 退件请求号 --receipt 原签收回执请求号 --reason 退件原因
+
+规则:
+  - 退件请求号、原签收回执请求号、退件原因均去除两端空白，不可为空或仅含空白
+  - 包裹、批次与接收站取自原回执及其批次，不允许另选
+  - 首次退件：原回执必须存在、为未撤销的有效签收，且尚未办理过退件；包裹必须仍在
+    原出发站归属下、状态为已签收，且最后一条轨迹就是该原回执；任一不符拒绝。
+    原批次已完成、中止或转交，以及其他成员的后续作业，均不阻止满足条件的退件
+  - 成功后该件恢复原出发站在站，追加一条退件轨迹（退件请求号、原签收、批次、
+    接收站、原因、时间）；原签收事实永久保留、仍计有效回执，原批次状态与进度
+    不因退件改变，不恢复旧批次配送，也不能再撤销该签收
+  - 退件算新流转，不恢复旧交接的退回资格；之后该件可交接、冻结、发运或加入
+    新的配送批次；再次签收可针对新回执办理退件，旧签收不能重复使用
+  - 退件请求号独立去重，可与其他业务编号同名：相同请求号且原签收、清理后的原因
+    相同，直接返回首次结果与时间，不检查现状、不追加轨迹或改写台账（后续流转及
+    再次退件后仍成立）；请求号相同但内容不同报冲突；失败的首次退件不占用请求号
+  - 每条签收只能成功退件一次，换请求号再退拒绝；同一签收的退件与撤销竞争至多
+    一方成功
+
+示例:
+  %s receipt-return --request RR1 --receipt RC1 --reason 签收后申请退货，实物送回
+`, appName, appName, appName)
+}
+
 func printBatchHelp(w io.Writer) {
 	fmt.Fprintf(w, `%s batch — 按批次号查询配送批次
 
@@ -408,6 +441,9 @@ func printBatchHelp(w io.Writer) {
 余件全部经回执办结时状态为已完成，续接转走最后一件待配送件时永久关闭为已转交。
 批次发生过回执撤销时，被撤销件标注“未回执（原回执已撤销）”，并另列撤销记录
 （撤销请求号、原回执请求号、包裹、批次、原因、时间）。
+批次中已真实签收后办理实物退件的成员仍按已回执展示并标注退件事实
+（接收站、退件请求号、时间），不列为待配送或已撤销回执，并另列退件记录；
+退件不改变批次状态与回执进度。
 已中止批次同时展示中止请求号、原因与时间，收回成员标注为“已收回”
 （不列为未回执待处理），已回执成员与已转交成员的真实回执照常展示。
 续接创建的新批次展示来源批次、原配送员、续接请求号与接手时间。
