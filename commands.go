@@ -136,17 +136,26 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  %d. 操作: 出站    站点: %s    批次号: %s    配送员: %s    时间: %s\n",
 				i+1, e.Station, e.Batch, e.Courier, e.Time.Format(timeFmt))
 		case "回执":
-			revoked := ""
-			if rc := store.ReceiptOf(e.Request); rc != nil && rc.RevokedBy != "" {
-				revoked = fmt.Sprintf("    撤销状态: 已撤销（撤销请求号: %s）", rc.RevokedBy)
+			note := ""
+			if rc := store.ReceiptOf(e.Request); rc != nil {
+				if rc.RevokedBy != "" {
+					note = fmt.Sprintf("    撤销状态: 已撤销（撤销请求号: %s）", rc.RevokedBy)
+				} else if rc.ReturnedBy != "" {
+					if rt := store.ReceiptReturnOf(rc.ReturnedBy); rt != nil {
+						note = fmt.Sprintf("    退件状态: 已退件入站（退件请求号: %s，时间: %s）", rt.Request, rt.Time.Format(timeFmt))
+					}
+				}
 			}
 			if e.Result == resultFailed {
 				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    原因: %s    请求号: %s    时间: %s%s\n",
-					i+1, e.Station, e.Batch, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt), revoked)
+					i+1, e.Station, e.Batch, e.Result, e.Reason, e.Request, e.Time.Format(timeFmt), note)
 			} else {
 				fmt.Fprintf(stdout, "  %d. 操作: 回执    站点: %s    批次号: %s    结果: %s    请求号: %s    时间: %s%s\n",
-					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt), revoked)
+					i+1, e.Station, e.Batch, e.Result, e.Request, e.Time.Format(timeFmt), note)
 			}
+		case "退件":
+			fmt.Fprintf(stdout, "  %d. 操作: 退件    接收站: %s    批次号: %s    退件请求号: %s    原签收回执请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Station, e.Batch, e.Request, e.RefRequest, e.Reason, e.Time.Format(timeFmt))
 		case "撤销回执":
 			fmt.Fprintf(stdout, "  %d. 操作: 撤销回执    站点: %s    批次号: %s    撤销请求号: %s    原回执请求号: %s    原因: %s    时间: %s\n",
 				i+1, e.Station, e.Batch, e.Request, e.RefRequest, e.Reason, e.Time.Format(timeFmt))
@@ -453,6 +462,8 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		headline = "回执成功（请求号重复提交，返回首次保存的结果，未再追加轨迹）"
 		if res.RevokedBy != "" {
 			headline = "回执成功（请求号重复提交，返回首次保存的结果；该回执已撤销，未恢复回执或改变当前状态）"
+		} else if res.ReturnedBy != "" {
+			headline = "回执成功（请求号重复提交，返回首次保存的结果；该签收已办理实物退件，未移动包裹或改变当前状态）"
 		}
 	}
 	fmt.Fprintf(stdout, "%s\n请求号: %s\n批次号: %s\n包裹编号: %s\n结果: %s\n",
@@ -462,6 +473,9 @@ func cmdReceipt(dataFile string, argv []string, stdout, stderr io.Writer) int {
 	}
 	if res.RevokedBy != "" {
 		fmt.Fprintf(stdout, "撤销状态: 已撤销（撤销请求号: %s）\n", res.RevokedBy)
+	}
+	if res.ReturnedBy != "" {
+		fmt.Fprintf(stdout, "退件状态: 已退件入站（退件请求号: %s）\n", res.ReturnedBy)
 	}
 	fmt.Fprintf(stdout, "发生时间: %s\n", res.Time.Format(timeFmt))
 	return exitOK
@@ -592,6 +606,9 @@ func cmdReceiptImport(dataFile string, argv []string, stdout, stderr io.Writer) 
 		if it.Revoked {
 			mark += "，该回执已撤销"
 		}
+		if it.Returned {
+			mark += "，该签收已退件"
+		}
 		line := fmt.Sprintf("  %d. 请求号: %s    批次号: %s    包裹编号: %s    结果: %s",
 			i+1, it.Record.Request, it.Record.Batch, it.Record.Parcel, it.Record.Result)
 		if it.Record.Result == resultFailed {
@@ -646,6 +663,53 @@ func cmdReceiptRevoke(dataFile string, argv []string, stdout, stderr io.Writer) 
 	}
 	fmt.Fprintf(stdout, "%s\n撤销请求号: %s\n原回执请求号: %s\n批次号: %s\n包裹编号: %s\n撤销原因: %s\n发生时间: %s\n",
 		headline, res.Request, res.Receipt, res.Batch, res.Parcel, res.Reason, res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdReceiptReturn(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("receipt-return", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "退件请求号（独立去重）")
+	receipt := fs.String("receipt", "", "原签收回执请求号")
+	reason := fs.String("reason", "", "退件原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printReceiptReturnHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("退件请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-return: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReceipt, err := cleanID("原签收回执请求号", *receipt)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-return: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("退件原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-return: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-return: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	res, replayed, err := store.ReceiptReturn(cleanReq, cleanReceipt, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s receipt-return: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "退件成功"
+	if replayed {
+		headline = "退件成功（退件请求号重复提交，返回首次保存的结果，未再追加退件轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n退件请求号: %s\n原签收回执请求号: %s\n批次号: %s\n包裹编号: %s\n接收站: %s\n退件原因: %s\n发生时间: %s\n",
+		headline, res.Request, res.Receipt, res.Batch, res.Parcel, res.Station, res.Reason, res.Time.Format(timeFmt))
 	return exitOK
 }
 
@@ -734,6 +798,12 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  - %s    已回执    结果: %s    请求号: %s    时间: %s\n",
 				pid, e.Result, e.Request, e.Time.Format(timeFmt))
 		}
+		if e.ReturnedBy != "" {
+			if rt := store.ReceiptReturnOf(e.ReturnedBy); rt != nil {
+				fmt.Fprintf(stdout, "      已退件入站    退件请求号: %s    退件时间: %s（实物已送回出发站，签收仍计有效回执）\n",
+					rt.Request, rt.Time.Format(timeFmt))
+			}
+		}
 	}
 	if len(allTransfers) > 0 {
 		fmt.Fprintf(stdout, "转交记录（%d 次，按提交顺序；转交不计回执）:\n", len(allTransfers))
@@ -750,6 +820,13 @@ func cmdBatch(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		for _, rv := range rvs {
 			fmt.Fprintf(stdout, "  - 撤销请求号: %s    原回执请求号: %s    包裹: %s    批次: %s    原因: %s    时间: %s\n",
 				rv.Request, rv.Receipt, rv.Parcel, rv.Batch, rv.Reason, rv.Time.Format(timeFmt))
+		}
+	}
+	if rts := store.BatchReceiptReturns(cleanIDVal); len(rts) > 0 {
+		fmt.Fprintf(stdout, "退件记录（%d 条；签收退件不改变批次状态与进度）:\n", len(rts))
+		for _, rt := range rts {
+			fmt.Fprintf(stdout, "  - 退件请求号: %s    原签收回执请求号: %s    包裹: %s    批次: %s    接收站: %s    原因: %s    时间: %s\n",
+				rt.Request, rt.Receipt, rt.Parcel, rt.Batch, rt.Station, rt.Reason, rt.Time.Format(timeFmt))
 		}
 	}
 	return exitOK

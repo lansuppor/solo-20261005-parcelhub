@@ -35,16 +35,16 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执 | 发运 | 接收 | 改址
-	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接/撤销回执为批次出发站；发运时为源站，接收时为目的站；改址时为源站，包裹不移动）
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执 | 退件 | 发运 | 接收 | 改址
+	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接/撤销回执/退件为批次出发站；发运时为源站，接收时为目的站；改址时为源站，包裹不移动）
 	Time       time.Time `json:"time"`                 // 发生时间
-	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接/撤销/接收/改址请求号（收件、出站、发运记录为空）
+	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接/撤销/退件/接收/改址请求号（收件、出站、发运记录为空）
 	From       string    `json:"from,omitempty"`       // 退回源站（原交接目的站，仅退回记录有）、发运/接收源站（仅发运、接收记录有）或改址前有效目的站（仅改址记录有）
 	To         string    `json:"to,omitempty"`         // 发运/接收目的站（仅发运、接收记录有）或改址后的新目的站（仅改址记录有）
 	Shipment   string    `json:"shipment,omitempty"`   // 运输单号（仅发运、接收、改址记录有）
-	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）、中止原因（仅收回记录有）、续接原因（仅续接记录有）、撤销原因（仅撤销回执记录有）或改址原因（仅改址记录有）
-	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）或被撤销的原回执请求号（仅撤销回执记录有）
-	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回、续接、撤销回执记录有；续接时为新批次号）
+	Reason     string    `json:"reason,omitempty"`     // 退回原因（仅退回记录有）、回执失败原因（仅失败回执有）、冻结原因（仅冻结记录有）、中止原因（仅收回记录有）、续接原因（仅续接记录有）、撤销原因（仅撤销回执记录有）、退件原因（仅退件记录有）或改址原因（仅改址记录有）
+	RefRequest string    `json:"refRequest,omitempty"` // 被退回的原交接请求号（仅退回记录有）、被撤销的原回执请求号（仅撤销回执记录有）或被退件的原签收回执请求号（仅退件记录有）
+	Batch      string    `json:"batch,omitempty"`      // 配送批次号（仅出站、回执、收回、续接、撤销回执、退件记录有；续接时为新批次号）
 	FromBatch  string    `json:"fromBatch,omitempty"`  // 续接原批次号（仅续接记录有）
 	Courier    string    `json:"courier,omitempty"`    // 配送员（仅出站、续接记录有；续接时为新配送员）
 	Result     string    `json:"result,omitempty"`     // 回执结果：签收 | 失败（仅回执记录有）
@@ -92,6 +92,9 @@ type ReceiptEntry struct {
 	Time    time.Time `json:"time"`
 	// RevokedBy 为撤销该回执的撤销请求号（未撤销为空）；撤销后该条不再计入有效回执。
 	RevokedBy string `json:"revokedBy,omitempty"`
+	// ReturnedBy 为对该签收办理实物退件入站的退件请求号（未退件为空）；退件不取消
+	// 回执，该条仍计有效回执；与撤销互斥。
+	ReturnedBy string `json:"returnedBy,omitempty"`
 }
 
 // BatchResult 记录一次成功的配送批次出站，用于批次号去重、结果重放与批次查询。
@@ -174,6 +177,25 @@ type ReceiptResult struct {
 	Time    time.Time `json:"time"`
 	// RevokedBy 为撤销该回执的撤销请求号（未撤销为空）；每条回执只能被撤销一次。
 	RevokedBy string `json:"revokedBy,omitempty"`
+	// ReturnedBy 为对该签收回执办理实物退件入站的退件请求号（未退件为空）。
+	// 退件不改变回执事实：该回执永久保留、仍计有效回执，且与撤销互斥（每条签收
+	// 回执至多成功退件一次，退件后不能再撤销该签收）；失败回执不能退件。
+	ReturnedBy string `json:"returnedBy,omitempty"`
+}
+
+// ReceiptReturnResult 记录一次成功的签收后实物退件入站，用于退件请求号去重与结果重放。
+// 退件表示已真实签收的包裹实物送回该次配送的出发站：该件恢复出发站在站，原签收
+// 事实永久保留、仍计有效回执，原批次状态与进度不改变，不恢复旧批次配送。退件算
+// 新的流转，不恢复旧交接的退回资格。退件请求号独立去重，可与其他业务编号同名；
+// 失败的首次退件不占用请求号。
+type ReceiptReturnResult struct {
+	Request string    `json:"request"` // 退件请求号
+	Receipt string    `json:"receipt"` // 原签收回执请求号
+	Batch   string    `json:"batch"`   // 原配送批次号（取自原回执）
+	Parcel  string    `json:"parcel"`  // 包裹编号（取自原回执）
+	Station string    `json:"station"` // 接收站（即原配送出发站，取自原批次）
+	Reason  string    `json:"reason"`  // 清理后的退件原因
+	Time    time.Time `json:"time"`    // 退件时间
 }
 
 // FreezeResult 记录一次成功的异常冻结，用于异常单号去重与结果重放。
@@ -300,20 +322,21 @@ type RerouteResult struct {
 
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
-	Version   int                        `json:"version"`
-	Parcels   map[string]*Parcel         `json:"parcels"`
-	Handoffs  map[string]*HandoffResult  `json:"handoffs"`
-	Returns   map[string]*ReturnResult   `json:"returns"`
-	Batches   map[string]*BatchResult    `json:"batches"`
-	Receipts  map[string]*ReceiptResult  `json:"receipts"`
-	Freezes   map[string]*FreezeResult   `json:"freezes"`   // 以异常单号为键（含已解除的异常单，永久保留）
-	Unfreezes map[string]*UnfreezeResult `json:"unfreezes"` // 以解除请求号为键
-	Aborts    map[string]*AbortResult    `json:"aborts"`    // 以中止请求号为键
-	Transfers map[string]*TransferResult `json:"transfers"` // 以续接请求号为键
-	Revokes   map[string]*RevokeResult   `json:"revokes"`   // 以撤销请求号为键
-	Shipments map[string]*ShipmentResult `json:"shipments"` // 以运输单号为键（含已接收的运输单，永久保留）
-	Receives  map[string]*ReceiveResult  `json:"receives"`  // 以接收请求号为键
-	Reroutes  map[string]*RerouteResult  `json:"reroutes"`  // 以改址请求号为键
+	Version        int                             `json:"version"`
+	Parcels        map[string]*Parcel              `json:"parcels"`
+	Handoffs       map[string]*HandoffResult       `json:"handoffs"`
+	Returns        map[string]*ReturnResult        `json:"returns"`
+	Batches        map[string]*BatchResult         `json:"batches"`
+	Receipts       map[string]*ReceiptResult       `json:"receipts"`
+	Freezes        map[string]*FreezeResult        `json:"freezes"`        // 以异常单号为键（含已解除的异常单，永久保留）
+	Unfreezes      map[string]*UnfreezeResult      `json:"unfreezes"`      // 以解除请求号为键
+	Aborts         map[string]*AbortResult         `json:"aborts"`         // 以中止请求号为键
+	Transfers      map[string]*TransferResult      `json:"transfers"`      // 以续接请求号为键
+	Revokes        map[string]*RevokeResult        `json:"revokes"`        // 以撤销请求号为键
+	ReceiptReturns map[string]*ReceiptReturnResult `json:"receiptReturns"` // 以退件请求号为键（签收后实物退件入站）
+	Shipments      map[string]*ShipmentResult      `json:"shipments"`      // 以运输单号为键（含已接收的运输单，永久保留）
+	Receives       map[string]*ReceiveResult       `json:"receives"`       // 以接收请求号为键
+	Reroutes       map[string]*RerouteResult       `json:"reroutes"`       // 以改址请求号为键
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -339,8 +362,8 @@ func Open(path string) (*Store, error) {
 			s.data = ledgerFile{Version: 1, Parcels: map[string]*Parcel{}, Handoffs: map[string]*HandoffResult{},
 				Returns: map[string]*ReturnResult{}, Batches: map[string]*BatchResult{}, Receipts: map[string]*ReceiptResult{},
 				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{},
-				Transfers: map[string]*TransferResult{}, Revokes: map[string]*RevokeResult{}, Shipments: map[string]*ShipmentResult{},
-				Receives: map[string]*ReceiveResult{}, Reroutes: map[string]*RerouteResult{}}
+				Transfers: map[string]*TransferResult{}, Revokes: map[string]*RevokeResult{}, ReceiptReturns: map[string]*ReceiptReturnResult{},
+				Shipments: map[string]*ShipmentResult{}, Receives: map[string]*ReceiveResult{}, Reroutes: map[string]*RerouteResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -378,6 +401,10 @@ func Open(path string) (*Store, error) {
 	}
 	if s.data.Revokes == nil {
 		s.data.Revokes = map[string]*RevokeResult{}
+	}
+	// 早期版本的数据文件没有 receiptReturns 字段：按空表处理（无签收退件），无需手工修改。
+	if s.data.ReceiptReturns == nil {
+		s.data.ReceiptReturns = map[string]*ReceiptReturnResult{}
 	}
 	// 早期版本的数据文件没有 shipments/receives 字段：按空表处理，无需手工修改。
 	if s.data.Shipments == nil {
@@ -472,6 +499,41 @@ func (l *ledgerFile) validate() error {
 				}
 				if rv.Receipt != e.RefRequest || rv.Batch != e.Batch || rv.Parcel != id || rv.Reason != e.Reason || !rv.Time.Equal(e.Time) {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条撤销回执轨迹与撤销请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+			}
+			if e.Op == "退件" {
+				if e.Batch == "" || e.Request == "" || e.RefRequest == "" || e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹缺少批次号、退件请求号、原签收请求号或原因", ErrCorrupt, id, i+1)
+				}
+				// 退件必须紧随原签收回执：已签收件在退件前不能发生其他作业
+				// （不能冻结、不能交接/出站，也不能先撤销），故原签收必须是上一条轨迹。
+				if i == 0 {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹前缺少原签收回执", ErrCorrupt, id, i+1)
+				}
+				prev := p.Trail[i-1]
+				if prev.Op != "回执" || prev.Request != e.RefRequest || prev.Result != resultSigned {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹未紧随原签收回执 %q", ErrCorrupt, id, i+1, e.RefRequest)
+				}
+				b, ok := l.Batches[e.Batch]
+				if !ok || b == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹引用了不存在的批次 %q", ErrCorrupt, id, i+1, e.Batch)
+				}
+				if e.Station != b.Station {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹的站点 %q 与批次 %q 出发站 %q 不一致",
+						ErrCorrupt, id, i+1, e.Station, e.Batch, b.Station)
+				}
+				rt, ok := l.ReceiptReturns[e.Request]
+				if !ok || rt == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹引用了不存在的退件请求 %q", ErrCorrupt, id, i+1, e.Request)
+				}
+				if rt.Receipt != e.RefRequest || rt.Batch != e.Batch || rt.Parcel != id ||
+					rt.Station != e.Station || rt.Reason != e.Reason || !rt.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹与退件请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				rc, ok := l.Receipts[e.RefRequest]
+				if !ok || rc == nil || rc.Result != resultSigned || rc.RevokedBy != "" || rc.ReturnedBy != e.Request {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条退件轨迹的原签收 %q 不存在、已撤销或未标记该退件",
+						ErrCorrupt, id, i+1, e.RefRequest)
 				}
 			}
 			if e.Op == "收回" {
@@ -711,7 +773,7 @@ func (l *ledgerFile) validate() error {
 		last := p.Trail[len(p.Trail)-1]
 		var want string
 		switch last.Op {
-		case "收件", "交接", "退回", "收回", "接收", "解除冻结":
+		case "收件", "交接", "退回", "收回", "接收", "解除冻结", "退件":
 			want = statusInStation
 		case "出站", "续接", "撤销回执":
 			want = statusDelivering
@@ -793,6 +855,20 @@ func (l *ledgerFile) validate() error {
 			}
 			if e.RevokedBy != rc.RevokedBy {
 				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执条目与回执请求号 %q 的撤销标记不一致", ErrCorrupt, id, pid, e.Request)
+			}
+			if e.ReturnedBy != rc.ReturnedBy {
+				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执条目与回执请求号 %q 的退件标记不一致", ErrCorrupt, id, pid, e.Request)
+			}
+			if e.RevokedBy != "" && e.ReturnedBy != "" {
+				return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执 %q 不能同时被撤销与退件", ErrCorrupt, id, pid, e.Request)
+			}
+			if e.ReturnedBy != "" {
+				if e.Result != resultSigned {
+					return fmt.Errorf("%w: 批次 %q 中包裹 %q 的失败回执 %q 不能办理退件", ErrCorrupt, id, pid, e.Request)
+				}
+				if rt, ok := l.ReceiptReturns[e.ReturnedBy]; !ok || rt == nil || rt.Receipt != e.Request {
+					return fmt.Errorf("%w: 批次 %q 中包裹 %q 的回执标记的退件请求号 %q 无法对应", ErrCorrupt, id, pid, e.ReturnedBy)
+				}
 			}
 		}
 		if b.AbortedBy != "" {
@@ -876,10 +952,24 @@ func (l *ledgerFile) validate() error {
 		}
 		if rc.RevokedBy == "" {
 			// 未撤销回执必须仍是该件在该批次的当前有效回执。
-			if e.Request != req || e.Result != rc.Result || e.Reason != rc.Reason || !e.Time.Equal(rc.Time) || e.RevokedBy != "" {
+			if e.Request != req || e.Result != rc.Result || e.Reason != rc.Reason || !e.Time.Equal(rc.Time) ||
+				e.RevokedBy != "" || e.ReturnedBy != rc.ReturnedBy {
 				return fmt.Errorf("%w: 回执请求号 %q 与批次 %q 的回执记录不一致", ErrCorrupt, req, rc.Batch)
 			}
+			// 已办理实物退件的签收：退件关联必须存在且回指该回执。
+			if rc.ReturnedBy != "" {
+				if rc.Result != resultSigned {
+					return fmt.Errorf("%w: 失败回执 %q 不能办理退件", ErrCorrupt, req)
+				}
+				rt, ok := l.ReceiptReturns[rc.ReturnedBy]
+				if !ok || rt == nil || rt.Receipt != req {
+					return fmt.Errorf("%w: 回执请求号 %q 标记的退件请求号 %q 无法对应", ErrCorrupt, req, rc.ReturnedBy)
+				}
+			}
 			continue
+		}
+		if rc.ReturnedBy != "" {
+			return fmt.Errorf("%w: 回执请求号 %q 不能同时被撤销与退件", ErrCorrupt, req)
 		}
 		// 已撤销回执：撤销关联必须存在且回指该回执。
 		rv, ok := l.Revokes[rc.RevokedBy]
@@ -924,6 +1014,60 @@ func (l *ledgerFile) validate() error {
 		}
 		if !found {
 			return fmt.Errorf("%w: 撤销请求号 %q 的包裹 %q 缺少对应的撤销回执轨迹", ErrCorrupt, req, rv.Parcel)
+		}
+	}
+	// 签收退件：每条退件必须对应一条未撤销的签收回执且回指该退件，批次、包裹、
+	// 接收站（批次出发站）一致，包裹轨迹中有与该退件请求一致的退件记录且该退件
+	// 紧随原签收；退件关联缺失、重复或与轨迹不符即损坏。
+	for req, rt := range l.ReceiptReturns {
+		if rt == nil || req != rt.Request || rt.Receipt == "" || rt.Batch == "" || rt.Parcel == "" ||
+			rt.Station == "" || rt.Reason == "" || rt.Time.IsZero() {
+			return fmt.Errorf("%w: 退件请求号 %q 的退件结果不完整", ErrCorrupt, req)
+		}
+		rc, ok := l.Receipts[rt.Receipt]
+		if !ok || rc == nil {
+			return fmt.Errorf("%w: 退件请求号 %q 引用了不存在的原回执 %q", ErrCorrupt, req, rt.Receipt)
+		}
+		if rc.Result != resultSigned {
+			return fmt.Errorf("%w: 退件请求号 %q 的原回执 %q 不是签收，不能退件", ErrCorrupt, req, rt.Receipt)
+		}
+		if rc.RevokedBy != "" {
+			return fmt.Errorf("%w: 退件请求号 %q 的原签收 %q 已被撤销，退件与撤销互斥", ErrCorrupt, req, rt.Receipt)
+		}
+		if rc.ReturnedBy != req {
+			return fmt.Errorf("%w: 退件请求号 %q 与原签收 %q 的退件标记不一致", ErrCorrupt, req, rt.Receipt)
+		}
+		if rc.Batch != rt.Batch || rc.Parcel != rt.Parcel {
+			return fmt.Errorf("%w: 退件请求号 %q 的批次或包裹与原签收 %q 不一致", ErrCorrupt, req, rt.Receipt)
+		}
+		b, ok := l.Batches[rt.Batch]
+		if !ok || b == nil {
+			return fmt.Errorf("%w: 退件请求号 %q 引用了不存在的批次 %q", ErrCorrupt, req, rt.Batch)
+		}
+		if rt.Station != b.Station {
+			return fmt.Errorf("%w: 退件请求号 %q 的接收站 %q 与批次 %q 出发站 %q 不一致",
+				ErrCorrupt, req, rt.Station, rt.Batch, b.Station)
+		}
+		p, ok := l.Parcels[rt.Parcel]
+		if !ok {
+			return fmt.Errorf("%w: 退件请求号 %q 引用了不存在的包裹 %q", ErrCorrupt, req, rt.Parcel)
+		}
+		found := false
+		for i, e := range p.Trail {
+			if e.Op != "退件" || e.Request != req {
+				continue
+			}
+			found = true
+			if i == 0 {
+				return fmt.Errorf("%w: 退件请求 %q 的轨迹前缺少原签收回执", ErrCorrupt, req)
+			}
+			prev := p.Trail[i-1]
+			if prev.Op != "回执" || prev.Request != rt.Receipt {
+				return fmt.Errorf("%w: 退件请求 %q 未紧随原签收回执 %q", ErrCorrupt, req, rt.Receipt)
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: 退件请求号 %q 的包裹 %q 缺少对应的退件轨迹", ErrCorrupt, req, rt.Parcel)
 		}
 	}
 	// 中止：收回集合必须恰为中止时仍由原批次配送的待配送成员（无有效回执且未在
@@ -1855,6 +1999,7 @@ type ReceiptImportItem struct {
 	Time     time.Time           // 发生时间（重放时为首次保存的时间）
 	Replayed bool                // true 表示同内容历史重放，未产生新变更
 	Revoked  bool                // true 表示该回执已被撤销（仅历史重放可能；重放不恢复回执）
+	Returned bool                // true 表示该签收已办理实物退件（仅历史重放可能；重放不移动包裹）
 }
 
 // ImportReceipts 按文件顺序整批应用回执记录。
@@ -1882,7 +2027,7 @@ func (s *Store) ImportReceipts(records []ReceiptImportRecord, now time.Time) ([]
 		if !replayed {
 			hasNew = true
 		}
-		items = append(items, ReceiptImportItem{Record: rec, Time: res.Time, Replayed: replayed, Revoked: res.RevokedBy != ""})
+		items = append(items, ReceiptImportItem{Record: rec, Time: res.Time, Replayed: replayed, Revoked: res.RevokedBy != "", Returned: res.ReturnedBy != ""})
 	}
 	if !hasNew {
 		return items, nil // 全部为历史重放：不改写台账
@@ -1943,6 +2088,9 @@ func (s *Store) RevokeReceipt(request, receiptReq, reason string, now time.Time)
 	}
 	if rc.RevokedBy != "" {
 		return nil, false, fmt.Errorf("撤销失败：原回执 %q 已撤销（撤销请求号 %q），每条原回执只能撤销一次", receiptReq, rc.RevokedBy)
+	}
+	if rc.ReturnedBy != "" {
+		return nil, false, fmt.Errorf("撤销失败：原签收 %q 已办理实物退件（退件请求号 %q），退件后不能再撤销该签收", receiptReq, rc.ReturnedBy)
 	}
 	b := s.data.Batches[rc.Batch] // 回执所属批次必存在（载入校验保证）
 	if b.AbortedBy != "" {
@@ -2007,6 +2155,117 @@ func (s *Store) RevokeReceipt(request, receiptReq, reason string, now time.Time)
 		return nil, false, err
 	}
 	return res, false, nil
+}
+
+// ReceiptReturn 办理签收后实物退件入站：已真实签收的包裹实物送回该次配送的出发站。
+// 包裹、批次与接收站（出发站）均取自原回执及其批次，不可另选。
+//
+// 首次退件：原回执必须存在、为未撤销的有效签收，且未办过退件；包裹仍在原出发站
+// 归属下为已签收，最后一条轨迹就是该回执。任一不满足则拒绝，不作任何改动。原批次
+// 已完成、已中止或已转交，以及其他成员的后续作业，都不阻止满足条件的退件。
+// 成功仅将该件恢复原出发站在站，追加一条退件轨迹：原签收事实永久保留、仍计有效
+// 回执，原批次状态与进度不因退件改变，不恢复旧批次配送，也不能再撤销该签收。
+// 退件算新的流转，不恢复旧交接的退回资格；之后可交接、冻结、发运或加入新的配送
+// 批次。再次签收可针对新回执办理退件，旧签收不能重复使用。
+// 退件请求号独立去重，可与其他业务编号同名：相同请求号、相同原签收及清理后相同
+// 原因，直接返回首次结果与时间，replayed 为 true，不检查现状、不追加轨迹或改写
+// 台账（后续流转及再次退件后仍成立）；请求号相同但内容不同报冲突。
+// 每条签收只成功退件一次，换请求号再退拒绝；失败的首次退件不占用请求号。
+func (s *Store) ReceiptReturn(request, receiptReq, reason string, now time.Time) (res *ReceiptReturnResult, replayed bool, err error) {
+	if saved, ok := s.data.ReceiptReturns[request]; ok {
+		if saved.Receipt == receiptReq && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("退件请求号 %q 已用于一次不同的退件（原签收=%q 原因=%q），内容冲突",
+			request, saved.Receipt, saved.Reason)
+	}
+
+	rc, ok := s.data.Receipts[receiptReq]
+	if !ok {
+		return nil, false, fmt.Errorf("退件失败：原回执请求号 %q 不存在", receiptReq)
+	}
+	if rc.Result != resultSigned {
+		return nil, false, fmt.Errorf("退件失败：原回执 %q 的结果为失败，只有真实签收的包裹才能办理退件", receiptReq)
+	}
+	if rc.RevokedBy != "" {
+		return nil, false, fmt.Errorf("退件失败：原签收 %q 已撤销（撤销请求号 %q），不是有效签收，不能退件", receiptReq, rc.RevokedBy)
+	}
+	if rc.ReturnedBy != "" {
+		return nil, false, fmt.Errorf("退件失败：原签收 %q 已办理退件（退件请求号 %q），每条签收只能成功退件一次",
+			receiptReq, rc.ReturnedBy)
+	}
+	b := s.data.Batches[rc.Batch] // 回执所属批次必存在（载入校验保证）
+	entry := b.Receipts[rc.Parcel]
+	if entry == nil || entry.Request != receiptReq || entry.RevokedBy != "" {
+		return nil, false, fmt.Errorf("退件失败：回执 %q 已不是包裹 %q 在批次 %q 的有效签收", receiptReq, rc.Parcel, rc.Batch)
+	}
+	p := s.data.Parcels[rc.Parcel] // 批次成员必已登记（载入校验保证）
+	if p.Station != b.Station {
+		return nil, false, fmt.Errorf("退件失败：包裹 %q 当前归属 %q，不在原出发站 %q 归属下，不能退件",
+			rc.Parcel, p.Station, b.Station)
+	}
+	if p.Status != statusSigned {
+		return nil, false, fmt.Errorf("退件失败：包裹 %q 当前状态为 %q，不是已签收，不能退件", rc.Parcel, p.Status)
+	}
+	last := p.Trail[len(p.Trail)-1]
+	if last.Op != "回执" || last.Request != receiptReq {
+		return nil, false, fmt.Errorf("退件失败：包裹 %q 在原签收 %q 之后又发生流转，最后一条轨迹不是该回执，不能退件",
+			rc.Parcel, receiptReq)
+	}
+
+	res = &ReceiptReturnResult{
+		Request: request,
+		Receipt: receiptReq,
+		Batch:   rc.Batch,
+		Parcel:  rc.Parcel,
+		Station: b.Station,
+		Reason:  reason,
+		Time:    now,
+	}
+	s.data.ReceiptReturns[request] = res
+	rc.ReturnedBy = request
+	entry.ReturnedBy = request
+
+	// 记录旧值，落盘失败时整体回滚。
+	oldStatus := p.Status
+	oldTrailLen := len(p.Trail)
+	p.Status = statusInStation // 实物送回原出发站，在站；站点不变（仍为出发站）
+	p.Trail = append(p.Trail, Event{
+		Op:         "退件",
+		Station:    b.Station,
+		Batch:      rc.Batch,
+		Request:    request,
+		RefRequest: receiptReq,
+		Reason:     reason,
+		Time:       now,
+	})
+
+	if err := s.save(); err != nil {
+		delete(s.data.ReceiptReturns, request)
+		rc.ReturnedBy = ""
+		entry.ReturnedBy = ""
+		p.Status = oldStatus
+		p.Trail = p.Trail[:oldTrailLen]
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// ReceiptReturnOf 按退件请求号返回退件结果；不存在时返回 nil。
+func (s *Store) ReceiptReturnOf(request string) *ReceiptReturnResult {
+	return s.data.ReceiptReturns[request]
+}
+
+// BatchReceiptReturns 返回一个配送批次相关的全部签收退件记录，按退件时间升序。
+func (s *Store) BatchReceiptReturns(batch string) []*ReceiptReturnResult {
+	var out []*ReceiptReturnResult
+	for _, rt := range s.data.ReceiptReturns {
+		if rt.Batch == batch {
+			out = append(out, rt)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	return out
 }
 
 // ReceiptOf 按回执请求号返回回执结果；不存在时返回 nil。
