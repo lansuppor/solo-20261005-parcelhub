@@ -110,6 +110,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReroute(dataFile, rest[1:], stdout, stderr)
 	case "shipment":
 		return cmdShipment(dataFile, rest[1:], stdout, stderr)
+	case "manifest-create":
+		return cmdManifestCreate(dataFile, rest[1:], stdout, stderr)
+	case "manifest-confirm":
+		return cmdManifestConfirm(dataFile, rest[1:], stdout, stderr)
+	case "manifest-cancel":
+		return cmdManifestCancel(dataFile, rest[1:], stdout, stderr)
+	case "manifest":
+		return cmdManifest(dataFile, rest[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q；运行 %s --help 查看可用命令\n", appName, cmd, appName)
 		return exitUsage
@@ -155,6 +163,10 @@ func printHelp(w io.Writer) {
   receive                到站接收：可指定未到包裹集合，也可不选、接收全部尚未接收件
   reroute                运输途中改址：将运输单当前全部未收件改送另一目的站，不另建运输单
   shipment               按运输单号查询两站、原成员、接收进度与各已收件的接收信息
+  manifest-create        配送出站前分拣：创建清单并整单预留成员（站点、状态不变）
+  manifest-confirm       整单确认待出站清单出站：按原顺序创建普通配送批次并释放预留
+  manifest-cancel        整单取消待出站清单：释放预留，不改变站点、状态或解除冻结
+  manifest               按清单号查询成员、站点、状态、创建时间及确认或取消信息
 
 常用示例:
   %s register --id P001 --station 站点A
@@ -179,16 +191,21 @@ func printHelp(w io.Writer) {
   %s receive  --request RS1 --shipment S1 --station 站点B
   %s reroute  --request RR1 --shipment S1 --expect 站点B --to 站点C --reason 站点B 暂停收货
   %s shipment --id S1
+  %s manifest-create --manifest M1 --station 站点A \
+              --parcel P001 --parcel P002
+  %s manifest-confirm --manifest M1 --batch B1 --courier 张三
+  %s manifest-cancel --request MC1 --manifest M1 --reason 配送计划取消
+  %s manifest --id M1
 
 无参数、-h 或 --help 显示本帮助。业务校验失败以状态码 1 退出；
 未知命令或参数提示于标准错误并以状态码 2 退出。
 
 并行使用: 多个终端可同时对同一台账作业。修改类命令自动取得该台账的
 进程间排他锁（争用时等待），在锁内读取最新已提交数据后完成受理、去重
-与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch 每次读取
-一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
+与整次原子保存，并行效果等同于某个逐次执行顺序；query、batch、manifest、shipment
+每次读取一份完整已提交台账，不加锁也不改写数据文件。锁随进程结束（含被强制
 终止）自动释放，无需人工删除协调文件（<数据文件>.lock）。
-`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
+`, appName, appVersion, appName, defaultDB, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName)
 }
 
 func printRegisterHelp(w io.Writer) {
@@ -215,7 +232,8 @@ func printQueryHelp(w io.Writer) {
 
 展示当前站点、当前状态、当前未解除异常（若有）及按提交顺序排列的完整轨迹；
 配送中包裹同时展示当前批次与当前配送员；站间在途包裹同时展示当前运输单号
-与当前有效目的站（发生过改址时另列原目的站）。
+与当前有效目的站（发生过改址时另列原目的站）；被待出站分拣清单预留的包裹
+同时展示当前预留（清单号、站点与创建时间）。
 交接记录同时显示请求号；退回记录同时显示源站、目的站、
 退回请求号、被退回的原交接请求号与原因；出站记录同时显示
 批次号与配送员；回执记录同时显示批次号、结果、原因（失败时）
@@ -227,7 +245,9 @@ func printQueryHelp(w io.Writer) {
 同时标注撤销状态；退件记录显示批次号、接收站、退件请求号、原签收
 请求号、原因和时间；发运记录显示运输单号、源站、目的站和时间；
 接收记录显示运输单号、接收请求号、源站、目的站和时间；
-改址记录显示运输单号、改址请求号、前后目的站、原因和时间。
+改址记录显示运输单号、改址请求号、前后目的站、原因和时间；
+分拣预留记录显示清单号、站点和时间；取消预留记录显示清单号、
+取消请求号、原因、站点和时间。
 包裹不存在时报错，不会创建记录。
 
 示例:
@@ -675,5 +695,94 @@ func printRerouteHelp(w io.Writer) {
 
 示例:
   %s reroute --request RR1 --shipment S1 --expect 站点B --to 站点C --reason 站点B 暂停收货
+`, appName, appName, appName)
+}
+
+func printManifestCreateHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s manifest-create — 配送出站前分拣（创建清单并整单预留成员）
+
+用法:
+  %s manifest-create [--data FILE] --manifest 清单号 --station 站点 \
+                     --parcel 包裹编号 [--parcel 包裹编号 ...]
+
+规则:
+  - 清单号、站点及每个包裹编号均去除两端空白，不可为空或仅含空白；
+    包裹集合不可为空且编号不可重复
+  - 首次创建：每件包裹必须已登记、在指定站点且状态为在站，且未被其他待出站
+    清单预留；任一不满足则整单拒绝，不作任何改动
+  - 成功时按首次提交顺序永久保存成员并整单预留，站点、状态不变；每件追加一条
+    含清单号、站点和时间的分拣预留管理记录（预留不算新流转）
+  - 待出站成员不能首次交接、退回、发运、直接 dispatch 或加入另一清单
+    （涉及它的批量操作整批拒绝）；允许冻结与解除，预留保留
+  - 清单号独立于其他编号，终结（已出站/已取消）后不复用：相同清单号且站点、
+    包裹集合相同（集合顺序无关）直接返回首次成员顺序与创建时间，不检查现状、
+    不重新预留、不追加轨迹或改写文件；清单号相同但站点或集合不同报冲突；
+    失败的首次创建不占用清单号
+
+示例:
+  %s manifest-create --manifest M1 --station 站点A --parcel P001 --parcel P002
+`, appName, appName, appName)
+}
+
+func printManifestConfirmHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s manifest-confirm — 整单确认分拣清单出站
+
+用法:
+  %s manifest-confirm [--data FILE] --manifest 清单号 --batch 配送批次号 --courier 配送员
+
+规则:
+  - 清单号、配送批次号、配送员均去除两端空白，不可为空或仅含空白
+  - 首次确认：清单必须存在且为待出站；批次号必须从未被出站或续接使用；
+    全部成员必须仍在清单站点在站且仍由本清单预留；冻结件导致整单拒绝。
+    任一不满足则整单拒绝，不作任何改动，不占用批次号
+  - 成功时按清单原顺序创建普通配送批次、释放预留，清单永久标记已出站；
+    成员转为“配送中”（站点仍记清单站点），各追加一条含批次、配送员和时间的
+    出站记录。后续配送作业（回执、中止、续接、退件等）照常，dispatch 可用
+    同一批次号按原内容重放
+  - 同清单、同批次、同配送员重复确认返回首次结果与时间，不检查现状、不追加
+    轨迹或改写文件；换批次或配送员报冲突。确认与取消竞争至多一方成功
+
+示例:
+  %s manifest-confirm --manifest M1 --batch B1 --courier 张三
+`, appName, appName, appName)
+}
+
+func printManifestCancelHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s manifest-cancel — 整单取消待出站分拣清单
+
+用法:
+  %s manifest-cancel [--data FILE] --request 取消请求号 --manifest 清单号 --reason 取消原因
+
+规则:
+  - 取消请求号、清单号、取消原因均去除两端空白，不可为空或仅含空白
+  - 只能取消待出站清单：整单释放预留、清单永久标记已取消，不改变站点、状态
+    或解除冻结（冻结件随清单取消预留，冻结保持）；每件追加一条含清单号、
+    取消请求号、原因、站点和时间的取消预留管理记录
+  - 取消不算新流转：取消后无新流转时，仍可退回原本可退回的交接
+  - 取消请求号独立去重，可与清单号及其他业务编号同名：相同取消请求号且清单、
+    清理后的原因相同，直接返回首次结果与时间，不检查现状、不追加轨迹或改写
+    文件；请求号相同但清单或原因不同报冲突。换取消请求号再次取消同一清单
+    拒绝；确认与取消竞争至多一方成功；失败的首次取消不占用请求号
+
+示例:
+  %s manifest-cancel --request MC1 --manifest M1 --reason 配送计划取消
+`, appName, appName, appName)
+}
+
+func printManifestHelp(w io.Writer) {
+	fmt.Fprintf(w, `%s manifest — 按清单号查询配送出站前分拣清单
+
+用法:
+  %s manifest [--data FILE] --id 清单号
+
+展示清单成员（按首次顺序）、站点、清单状态（待出站 / 已出站 / 已取消）、
+创建时间；已出站清单同时展示确认批次号、配送员与出站时间，已取消清单同时
+展示取消请求号、取消原因与取消时间。清单不存在时报错。
+成员当前是否被该清单预留请用 query 查看（query 显示当前预留与完整轨迹，
+分拣预留记录显示清单号、站点和时间，取消预留记录显示清单号、取消请求号、
+原因、站点和时间）。
+
+示例:
+  %s manifest --id M1
 `, appName, appName, appName)
 }

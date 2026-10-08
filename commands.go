@@ -126,6 +126,10 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "当前未解除异常: 异常单号: %s    原因: %s    冻结时间: %s\n",
 			f.Incident, f.Reason, f.Time.Format(timeFmt))
 	}
+	if m := store.ActiveManifest(cleanIDVal); m != nil {
+		fmt.Fprintf(stdout, "当前预留: 分拣清单号: %s    站点: %s    创建时间: %s\n",
+			m.Manifest, m.Station, m.Time.Format(timeFmt))
+	}
 	fmt.Fprintf(stdout, "轨迹（按提交顺序，共 %d 条）:\n", len(p.Trail))
 	for i, e := range p.Trail {
 		switch e.Op {
@@ -174,6 +178,12 @@ func cmdQuery(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		case "改址":
 			fmt.Fprintf(stdout, "  %d. 操作: 改址    运输单号: %s    原目的站: %s    新目的站: %s    改址请求号: %s    原因: %s    时间: %s\n",
 				i+1, e.Shipment, e.From, e.To, e.Request, e.Reason, e.Time.Format(timeFmt))
+		case "分拣预留":
+			fmt.Fprintf(stdout, "  %d. 操作: 分拣预留    分拣清单号: %s    站点: %s    时间: %s\n",
+				i+1, e.Manifest, e.Station, e.Time.Format(timeFmt))
+		case "取消预留":
+			fmt.Fprintf(stdout, "  %d. 操作: 取消预留    分拣清单号: %s    站点: %s    取消请求号: %s    原因: %s    时间: %s\n",
+				i+1, e.Manifest, e.Station, e.Request, e.Reason, e.Time.Format(timeFmt))
 		default:
 			req := e.Request
 			if req == "" {
@@ -1304,6 +1314,202 @@ func cmdShipment(dataFile string, argv []string, stdout, stderr io.Writer) int {
 		rv := store.ReceiveOf(sh.ReceivedBy)
 		fmt.Fprintf(stdout, "接收请求号: %s\n接收站点: %s\n接收时间: %s\n",
 			rv.Request, rv.Station, rv.Time.Format(timeFmt))
+	}
+	return exitOK
+}
+
+func cmdManifestCreate(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("manifest-create", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	manifest := fs.String("manifest", "", "分拣清单号（独立于其他编号，终结后也不能复用）")
+	station := fs.String("station", "", "站点")
+	var parcels stringList
+	fs.Var(&parcels, "parcel", "包裹编号，可重复指定；集合不可为空或含重复编号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printManifestCreateHelp); !ok {
+		return code
+	}
+
+	cleanManifest, err := cleanID("分拣清单号", *manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-create: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanStation, err := cleanID("站点", *station)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-create: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanParcels, err := cleanParcelList(parcels)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-create: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-create: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	res, replayed, err := store.CreateManifest(cleanManifest, cleanStation, cleanParcels, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-create: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "清单创建成功"
+	if replayed {
+		headline = "清单创建成功（清单号重复提交，返回首次保存的成员顺序与时间，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n分拣清单号: %s\n站点: %s\n当前状态: %s\n包裹（%d 件）:\n",
+		headline, res.Manifest, res.Station, res.Status, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "创建时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdManifestConfirm(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("manifest-confirm", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	manifest := fs.String("manifest", "", "要确认出站的分拣清单号（必须为待出站）")
+	batch := fs.String("batch", "", "配送批次号（从未被出站或续接使用）")
+	courier := fs.String("courier", "", "配送员")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printManifestConfirmHelp); !ok {
+		return code
+	}
+
+	cleanManifest, err := cleanID("分拣清单号", *manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-confirm: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanBatch, err := cleanID("配送批次号", *batch)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-confirm: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanCourier, err := cleanID("配送员", *courier)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-confirm: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-confirm: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	res, replayed, err := store.ConfirmManifest(cleanManifest, cleanBatch, cleanCourier, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-confirm: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "清单确认出站成功"
+	if replayed {
+		headline = "清单确认出站成功（清单与批次重复提交，返回首次保存的结果与时间，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n分拣清单号: %s\n批次号: %s\n出发站: %s\n配送员: %s\n包裹（%d 件）:\n",
+		headline, res.Manifest, res.Batch, res.Station, res.Courier, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "出站时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdManifestCancel(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("manifest-cancel", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	request := fs.String("request", "", "取消请求号（独立去重）")
+	manifest := fs.String("manifest", "", "要取消的分拣清单号（只能取消待出站清单）")
+	reason := fs.String("reason", "", "取消原因")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printManifestCancelHelp); !ok {
+		return code
+	}
+
+	cleanReq, err := cleanID("取消请求号", *request)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-cancel: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanManifest, err := cleanID("分拣清单号", *manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-cancel: %v\n", appName, err)
+		return exitBusiness
+	}
+	cleanReason, err := cleanID("取消原因", *reason)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-cancel: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, release, err := OpenForUpdate(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-cancel: %v\n", appName, err)
+		return exitBusiness
+	}
+	defer release()
+	res, replayed, err := store.CancelManifest(cleanReq, cleanManifest, cleanReason, now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest-cancel: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	headline := "清单取消成功"
+	if replayed {
+		headline = "清单取消成功（取消请求号重复提交，返回首次保存的结果与时间，未再追加轨迹）"
+	}
+	fmt.Fprintf(stdout, "%s\n取消请求号: %s\n分拣清单号: %s\n站点: %s\n取消原因: %s\n包裹（%d 件）:\n",
+		headline, res.Request, res.Manifest, res.Station, res.Reason, len(res.Parcels))
+	for _, id := range res.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", id)
+	}
+	fmt.Fprintf(stdout, "取消时间: %s\n", res.Time.Format(timeFmt))
+	return exitOK
+}
+
+func cmdManifest(dataFile string, argv []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("manifest", stderr)
+	fs.StringVar(&dataFile, "data", dataFile, "本地台账数据文件路径")
+	id := fs.String("id", "", "要查询的分拣清单号")
+	if ok, code := parseFlags(fs, argv, stdout, stderr, printManifestHelp); !ok {
+		return code
+	}
+
+	cleanIDVal, err := cleanID("分拣清单号", *id)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	store, err := Open(dataFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest: %v\n", appName, err)
+		return exitBusiness
+	}
+	m, err := store.ManifestQuery(cleanIDVal)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s manifest: %v\n", appName, err)
+		return exitBusiness
+	}
+
+	fmt.Fprintf(stdout, "分拣清单号: %s\n站点: %s\n清单状态: %s\n成员（%d 件，按首次顺序）:\n",
+		m.Manifest, m.Station, m.Status, len(m.Parcels))
+	for _, pid := range m.Parcels {
+		fmt.Fprintf(stdout, "  - %s\n", pid)
+	}
+	fmt.Fprintf(stdout, "创建时间: %s\n", m.Time.Format(timeFmt))
+	if cr := store.ManifestConfirmOf(m); cr != nil {
+		fmt.Fprintf(stdout, "确认批次号: %s\n配送员: %s\n出站时间: %s\n",
+			cr.Batch, cr.Courier, cr.Time.Format(timeFmt))
+	}
+	if r := store.ManifestCancelOf(m); r != nil {
+		fmt.Fprintf(stdout, "取消请求号: %s\n取消原因: %s\n取消时间: %s\n",
+			r.Request, r.Reason, r.Time.Format(timeFmt))
 	}
 	return exitOK
 }

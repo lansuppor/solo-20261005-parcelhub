@@ -27,6 +27,16 @@ const (
 	statusInTransit = "站间在途"
 )
 
+// 分拣清单状态。
+const (
+	// manifestPending 表示清单已创建、成员已整单预留，尚未确认出站或取消。
+	manifestPending = "待出站"
+	// manifestConfirmed 表示清单已整单确认出站：成员转为配送中，清单永久终结、不可复用。
+	manifestConfirmed = "已出站"
+	// manifestCancelled 表示清单已整单取消：预留已释放，清单永久终结、不可复用。
+	manifestCancelled = "已取消"
+)
+
 // 回执结果。
 const (
 	resultSigned = "签收"
@@ -35,7 +45,7 @@ const (
 
 // Event 是包裹轨迹中的一条记录，按提交顺序追加。
 type Event struct {
-	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执 | 退件 | 发运 | 接收 | 改址
+	Op         string    `json:"op"`                   // 收件 | 交接 | 退回 | 出站 | 回执 | 冻结 | 解除冻结 | 收回 | 续接 | 撤销回执 | 退件 | 发运 | 接收 | 改址 | 分拣预留 | 取消预留
 	Station    string    `json:"station"`              // 与该操作有关的站点（退回时为退回目的站，即原交接源站；冻结/解除冻结为包裹所在站点；收回/续接/撤销回执/退件为批次出发站；发运时为源站，接收时为目的站；改址时为源站，包裹不移动）
 	Time       time.Time `json:"time"`                 // 发生时间
 	Request    string    `json:"request,omitempty"`    // 交接/退回/回执/收回/续接/撤销/退件/接收/改址请求号（收件、出站、发运记录为空）
@@ -51,6 +61,9 @@ type Event struct {
 	// Incident 为冻结/解除冻结记录的异常单号；解除冻结时另外用 Request 存解除请求号、Note 存处理说明。
 	Incident string `json:"incident,omitempty"`
 	Note     string `json:"note,omitempty"`
+	// Manifest 为分拣预留/取消预留记录的清单号（仅这两类管理记录有；确认出站产生的是普通出站记录，
+	// 其批次号在 Batch 字段）。取消预留时另外用 Request 存取消请求号、Reason 存取消原因。
+	Manifest string `json:"manifest,omitempty"`
 }
 
 // Parcel 是一件包裹的台账信息。
@@ -320,6 +333,57 @@ type RerouteResult struct {
 	Time     time.Time `json:"time"`     // 改址时间
 }
 
+// SortManifest 记录一次成功的配送出站前分拣清单创建，用于清单号去重、结果重放与清单查询。
+// 创建表示先把整单成员在本站预留：成员按首次提交顺序永久保存，站点、状态不变，
+// 每件追加一条分拣预留管理记录。待出站成员不能首次交接、退回、发运、直接 dispatch
+// 或加入另一清单；冻结与解除允许，预留保留。预留与取消只是管理记录，不算新流转。
+// 确认出站时按原顺序创建普通配送批次、释放预留、清单永久标记已出站（成员转配送中）；
+// 取消时整单释放预留、清单永久标记已取消（不改变站点、状态或解除冻结）。
+// 清单号独立于其他业务编号，终结（已出站/已取消）后不复用；失败的首次创建不占用清单号。
+type SortManifest struct {
+	Manifest string    `json:"manifest"` // 清单号
+	Station  string    `json:"station"`  // 站点
+	Parcels  []string  `json:"parcels"`  // 成员，按首次提交顺序永久保存
+	Time     time.Time `json:"time"`     // 创建时间
+	Status   string    `json:"status"`   // 待出站 | 已出站 | 已取消
+	// ConfirmedBy 为确认该清单出站的确认记录键（清单号 + "\x00" + 批次号）；
+	// 尚未确认时为空。确认永久生效，清单号不释放。
+	ConfirmedBy string `json:"confirmedBy,omitempty"`
+	// CancelledBy 为取消该清单的取消请求号（尚未取消时为空）；与 ConfirmedBy 互斥。
+	CancelledBy string `json:"cancelledBy,omitempty"`
+}
+
+// manifestConfirmKey 是确认结果在 ManifestConfirms 表中的键：确认去重以（清单号、批次号）
+// 为身份（配送员是确认内容的一部分，必须与首次一致），与各请求号去重范围独立。
+func manifestConfirmKey(manifest, batch string) string { return manifest + "\x00" + batch }
+
+// ManifestConfirmResult 记录一次成功的清单确认出站。确认按清单原顺序创建普通配送批次，
+// 释放预留：成员转为“配送中”（站点仍记清单站点），各追加一条普通出站记录；后续配送
+// 作业（回执、中止、续接、dispatch 同批次同内容重放）与普通出站批次完全一致。
+// 同清单、同批次、同配送员重复确认返回首次结果与时间，不检查现状、不追加轨迹；
+// 换批次或配送员报冲突。
+type ManifestConfirmResult struct {
+	Manifest string    `json:"manifest"` // 清单号
+	Batch    string    `json:"batch"`    // 配送批次号
+	Courier  string    `json:"courier"`  // 配送员
+	Parcels  []string  `json:"parcels"`  // 清单原顺序成员
+	Station  string    `json:"station"`  // 出发站（取自清单）
+	Time     time.Time `json:"time"`     // 确认（出站）时间
+}
+
+// ManifestCancelResult 记录一次成功的分拣清单取消，用于取消请求号去重与结果重放。
+// 取消只作用于待出站清单：整单释放预留、清单永久标记已取消，不改变站点、状态或
+// 解除冻结。取消只是管理记录，不算新流转；取消后无新流转时仍可退回原本可退回的交接。
+// 取消请求号独立去重，可与清单号及其他业务编号同名；失败的首次取消不占用请求号。
+type ManifestCancelResult struct {
+	Request  string    `json:"request"`  // 取消请求号
+	Manifest string    `json:"manifest"` // 被取消的清单号
+	Reason   string    `json:"reason"`   // 清理后的取消原因
+	Parcels  []string  `json:"parcels"`  // 清单原顺序成员
+	Station  string    `json:"station"`  // 清单站点（取消不改变站点）
+	Time     time.Time `json:"time"`     // 取消时间
+}
+
 // ledgerFile 是本地数据文件的磁盘结构。
 type ledgerFile struct {
 	Version   int                        `json:"version"`
@@ -339,6 +403,12 @@ type ledgerFile struct {
 	Shipments      map[string]*ShipmentResult      `json:"shipments"` // 以运输单号为键（含已接收的运输单，永久保留）
 	Receives       map[string]*ReceiveResult       `json:"receives"`  // 以接收请求号为键
 	Reroutes       map[string]*RerouteResult       `json:"reroutes"`  // 以改址请求号为键
+	// 分拣清单相关三张表：旧版数据文件没有这些字段，按空表处理，旧有效台账直接使用。
+	// 当前预留不另存表：它由状态为“待出站”的清单成员唯一推导（一件包裹同时最多被
+	// 一张待出站清单预留，载入校验强制）。
+	Manifests        map[string]*SortManifest          `json:"manifests,omitempty"`        // 以清单号为键（含已终结清单，永久保留）
+	ManifestConfirms map[string]*ManifestConfirmResult `json:"manifestConfirms,omitempty"` // 以 清单号\x00批次号 为键
+	ManifestCancels  map[string]*ManifestCancelResult  `json:"manifestCancels,omitempty"`  // 以取消请求号为键
 }
 
 // Store 是一个数据文件对应的包裹站点交接台账。
@@ -366,7 +436,9 @@ func Open(path string) (*Store, error) {
 				Freezes: map[string]*FreezeResult{}, Unfreezes: map[string]*UnfreezeResult{}, Aborts: map[string]*AbortResult{},
 				Transfers: map[string]*TransferResult{}, Revokes: map[string]*RevokeResult{}, Shipments: map[string]*ShipmentResult{},
 				Receives: map[string]*ReceiveResult{}, Reroutes: map[string]*RerouteResult{},
-				ReceiptReturns: map[string]*ReceiptReturnResult{}}
+				ReceiptReturns: map[string]*ReceiptReturnResult{},
+				Manifests:      map[string]*SortManifest{}, ManifestConfirms: map[string]*ManifestConfirmResult{},
+				ManifestCancels: map[string]*ManifestCancelResult{}}
 			return s, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -419,6 +491,16 @@ func Open(path string) (*Store, error) {
 	// 早期版本的数据文件没有 reroutes 字段：按空表处理（各运输单均未改址），无需手工修改。
 	if s.data.Reroutes == nil {
 		s.data.Reroutes = map[string]*RerouteResult{}
+	}
+	// 早期版本的数据文件没有分拣清单相关字段：按空表处理，旧有效台账直接使用。
+	if s.data.Manifests == nil {
+		s.data.Manifests = map[string]*SortManifest{}
+	}
+	if s.data.ManifestConfirms == nil {
+		s.data.ManifestConfirms = map[string]*ManifestConfirmResult{}
+	}
+	if s.data.ManifestCancels == nil {
+		s.data.ManifestCancels = map[string]*ManifestCancelResult{}
 	}
 	for _, b := range s.data.Batches {
 		if b != nil && b.Receipts == nil {
@@ -673,6 +755,50 @@ func (l *ledgerFile) validate() error {
 					return fmt.Errorf("%w: 包裹 %q 第 %d 条解除冻结轨迹与解除请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
 				}
 			}
+			if e.Op == "分拣预留" {
+				if e.Manifest == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条分拣预留轨迹缺少清单号", ErrCorrupt, id, i+1)
+				}
+				m, ok := l.Manifests[e.Manifest]
+				if !ok || m == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条分拣预留轨迹引用了不存在的分拣清单 %q", ErrCorrupt, id, i+1, e.Manifest)
+				}
+				if m.Station != e.Station || !m.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条分拣预留轨迹与清单 %q 记录不一致", ErrCorrupt, id, i+1, e.Manifest)
+				}
+				inManifest := false
+				for _, pid := range m.Parcels {
+					if pid == id {
+						inManifest = true
+						break
+					}
+				}
+				if !inManifest {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条分拣预留轨迹不在清单 %q 的成员集合中", ErrCorrupt, id, i+1, e.Manifest)
+				}
+			}
+			if e.Op == "取消预留" {
+				if e.Manifest == "" || e.Request == "" || e.Reason == "" {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条取消预留轨迹缺少清单号、取消请求号或原因", ErrCorrupt, id, i+1)
+				}
+				r, ok := l.ManifestCancels[e.Request]
+				if !ok || r == nil {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条取消预留轨迹引用了不存在的取消请求 %q", ErrCorrupt, id, i+1, e.Request)
+				}
+				if r.Manifest != e.Manifest || r.Reason != e.Reason || r.Station != e.Station || !r.Time.Equal(e.Time) {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条取消预留轨迹与取消请求 %q 记录不一致", ErrCorrupt, id, i+1, e.Request)
+				}
+				inCancel := false
+				for _, pid := range r.Parcels {
+					if pid == id {
+						inCancel = true
+						break
+					}
+				}
+				if !inCancel {
+					return fmt.Errorf("%w: 包裹 %q 第 %d 条取消预留轨迹不在取消请求 %q 的成员集合中", ErrCorrupt, id, i+1, e.Request)
+				}
+			}
 		}
 	}
 	// 站间运输生命周期：按每件轨迹的保存顺序（不按发生时间排序）核对发运、改址与
@@ -757,11 +883,21 @@ func (l *ledgerFile) validate() error {
 	// 站点与状态，与台账当前值不一致即存在无对应记录的站点或状态改变。接收后的
 	// 合法后续流转（交接、再次发运、回执及其撤销、收回、续接、冻结与解除）会
 	// 产生新的末条轨迹，按新轨迹校验，不因历史接收而把成员固定在目的站。
+	// 分拣预留与取消预留不移动实物、不改变状态（冻结件取消后仍为异常冻结），
+	// 推导时跳过这两类管理记录，取最后一条状态承载轨迹。
 	for id, p := range l.Parcels {
-		last := p.Trail[len(p.Trail)-1]
+		var last Event
+		for i := len(p.Trail) - 1; i >= 0; i-- {
+			op := p.Trail[i].Op
+			if op == "分拣预留" || op == "取消预留" {
+				continue
+			}
+			last = p.Trail[i]
+			break
+		}
 		var want string
 		switch last.Op {
-		case "收件", "交接", "退回", "收回", "接收", "解除冻结", "退件":
+		case "收件", "交接", "退回", "收回", "接收", "解除冻结", "退件", "分拣预留", "取消预留":
 			want = statusInStation
 		case "出站", "续接", "撤销回执":
 			want = statusDelivering
@@ -1526,6 +1662,254 @@ func (l *ledgerFile) validate() error {
 			return fmt.Errorf("%w: 异常单 %q 未解除，但包裹 %q 当前状态为 %q", ErrCorrupt, no, f.Parcel, p.Status)
 		}
 	}
+	if err := l.validateManifests(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateManifests 校验分拣清单、预留、确认批次、取消请求与逐件轨迹之间的自洽性：
+// 拒绝新增关联空缺、重复预留，以及清单与轨迹、确认批次矛盾的台账。
+func (l *ledgerFile) validateManifests() error {
+	// reservedBy 记录每件包裹当前被预留的待出站清单号（由待出站清单成员推导）。
+	// 一件包裹同时最多被一张待出站清单预留；重复预留即损坏。
+	reservedBy := make(map[string]string)
+	for no, m := range l.Manifests {
+		if m == nil || no != m.Manifest || m.Station == "" || len(m.Parcels) == 0 || m.Time.IsZero() {
+			return fmt.Errorf("%w: 分拣清单号 %q 的清单结果不完整", ErrCorrupt, no)
+		}
+		switch m.Status {
+		case manifestPending, manifestConfirmed, manifestCancelled:
+		default:
+			return fmt.Errorf("%w: 分拣清单 %q 的状态 %q 不受支持", ErrCorrupt, no, m.Status)
+		}
+		seen := make(map[string]bool, len(m.Parcels))
+		for _, pid := range m.Parcels {
+			if seen[pid] {
+				return fmt.Errorf("%w: 分拣清单 %q 的成员 %q 重复", ErrCorrupt, no, pid)
+			}
+			seen[pid] = true
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 分拣清单 %q 引用了不存在的包裹 %q", ErrCorrupt, no, pid)
+			}
+			// 每件成员对该清单必须恰有一条分拣预留记录；已取消清单还必须恰有一条
+			// 对应取消请求的取消预留记录；已出站清单不得带有取消预留记录。
+			reserveCount := 0
+			cancelCount := 0
+			for _, e := range p.Trail {
+				if e.Op == "分拣预留" && e.Manifest == no {
+					reserveCount++
+				}
+				if e.Op == "取消预留" && e.Manifest == no {
+					cancelCount++
+					if m.Status == manifestCancelled && e.Request != m.CancelledBy {
+						return fmt.Errorf("%w: 已取消分拣清单 %q 的成员包裹 %q 的取消预留请求号 %q 与清单标记的 %q 不一致",
+							ErrCorrupt, no, pid, e.Request, m.CancelledBy)
+					}
+				}
+			}
+			if reserveCount != 1 {
+				return fmt.Errorf("%w: 分拣清单 %q 的成员包裹 %q 应有恰好一条分拣预留轨迹，实际 %d 条",
+					ErrCorrupt, no, pid, reserveCount)
+			}
+			switch m.Status {
+			case manifestCancelled:
+				if cancelCount != 1 {
+					return fmt.Errorf("%w: 已取消分拣清单 %q 的成员包裹 %q 应有恰好一条取消预留轨迹，实际 %d 条",
+						ErrCorrupt, no, pid, cancelCount)
+				}
+				// 取消预留记录必须在分拣预留之后。
+				reservePos, cancelPos := -1, -1
+				for i, e := range p.Trail {
+					if e.Op == "分拣预留" && e.Manifest == no {
+						reservePos = i
+					}
+					if e.Op == "取消预留" && e.Manifest == no {
+						cancelPos = i
+					}
+				}
+				if reservePos < 0 || cancelPos <= reservePos {
+					return fmt.Errorf("%w: 已取消分拣清单 %q 的成员包裹 %q 的取消预留轨迹必须位于分拣预留之后",
+						ErrCorrupt, no, pid)
+				}
+			case manifestConfirmed:
+				// 确认批次的出站记录必须在分拣预留之后。
+				if m.ConfirmedBy != "" {
+					cr := l.ManifestConfirms[m.ConfirmedBy]
+					if cr != nil {
+						reservePos, outboundPos := -1, -1
+						for i, e := range p.Trail {
+							if e.Op == "分拣预留" && e.Manifest == no {
+								reservePos = i
+							}
+							if e.Op == "出站" && e.Batch == cr.Batch {
+								outboundPos = i
+							}
+						}
+						if outboundPos < 0 || reservePos < 0 || outboundPos < reservePos {
+							return fmt.Errorf("%w: 已出站分拣清单 %q 的成员包裹 %q 缺少分拣预留之后的确认出站轨迹",
+								ErrCorrupt, no, pid)
+						}
+					}
+				}
+			default:
+				if cancelCount != 0 {
+					return fmt.Errorf("%w: 分拣清单 %q 状态为 %q，但成员包裹 %q 带有取消预留轨迹",
+						ErrCorrupt, no, m.Status, pid)
+				}
+			}
+			if m.Status == manifestPending {
+				if other, dup := reservedBy[pid]; dup {
+					return fmt.Errorf("%w: 包裹 %q 同时被分拣清单 %q 与 %q 预留，一件包裹只能被一张待出站清单预留",
+						ErrCorrupt, pid, other, no)
+				}
+				reservedBy[pid] = no
+			}
+		}
+		if m.ConfirmedBy != "" && m.CancelledBy != "" {
+			return fmt.Errorf("%w: 分拣清单 %q 不能同时标记确认与取消，二者互斥", ErrCorrupt, no)
+		}
+		switch m.Status {
+		case manifestPending:
+			// 待出站：确认与取消标记必须均空。
+			if m.ConfirmedBy != "" || m.CancelledBy != "" {
+				return fmt.Errorf("%w: 待出站分拣清单 %q 不应带有确认或取消标记", ErrCorrupt, no)
+			}
+		case manifestConfirmed:
+			if m.ConfirmedBy == "" {
+				return fmt.Errorf("%w: 已出站分拣清单 %q 缺少确认标记", ErrCorrupt, no)
+			}
+			cr, ok := l.ManifestConfirms[m.ConfirmedBy]
+			if !ok || cr == nil {
+				return fmt.Errorf("%w: 分拣清单 %q 标记的确认记录 %q 无法对应", ErrCorrupt, no, m.ConfirmedBy)
+			}
+			if cr.Manifest != no {
+				return fmt.Errorf("%w: 分拣清单 %q 的确认记录属于清单 %q", ErrCorrupt, no, cr.Manifest)
+			}
+			b, ok := l.Batches[cr.Batch]
+			if !ok || b == nil {
+				return fmt.Errorf("%w: 分拣清单 %q 的确认批次 %q 不存在", ErrCorrupt, no, cr.Batch)
+			}
+			if b.Station != m.Station || b.Courier != cr.Courier || !sameOrder(b.Parcels, m.Parcels) {
+				return fmt.Errorf("%w: 分拣清单 %q 与确认批次 %q 的站点、配送员或原顺序成员不一致", ErrCorrupt, no, cr.Batch)
+			}
+			if b.RelayedFrom != "" {
+				return fmt.Errorf("%w: 分拣清单 %q 的确认批次 %q 是续接批次，确认只能创建普通配送批次", ErrCorrupt, no, cr.Batch)
+			}
+		case manifestCancelled:
+			if m.CancelledBy == "" {
+				return fmt.Errorf("%w: 已取消分拣清单 %q 缺少取消标记", ErrCorrupt, no)
+			}
+			r, ok := l.ManifestCancels[m.CancelledBy]
+			if !ok || r == nil {
+				return fmt.Errorf("%w: 分拣清单 %q 标记的取消请求号 %q 无法对应", ErrCorrupt, no, m.CancelledBy)
+			}
+			if r.Manifest != no || r.Station != m.Station || !sameOrder(r.Parcels, m.Parcels) {
+				return fmt.Errorf("%w: 分拣清单 %q 与取消请求 %q 的记录不一致", ErrCorrupt, no, m.CancelledBy)
+			}
+		}
+	}
+	// 确认记录：必须被其清单引用，且每件成员轨迹中有对应该确认批次的出站记录。
+	for key, cr := range l.ManifestConfirms {
+		if cr == nil || key != manifestConfirmKey(cr.Manifest, cr.Batch) || cr.Station == "" ||
+			cr.Courier == "" || len(cr.Parcels) == 0 || cr.Time.IsZero() {
+			return fmt.Errorf("%w: 分拣清单确认键 %q 的确认结果不完整", ErrCorrupt, key)
+		}
+		m, ok := l.Manifests[cr.Manifest]
+		if !ok || m == nil {
+			return fmt.Errorf("%w: 确认记录引用了不存在的分拣清单 %q", ErrCorrupt, cr.Manifest)
+		}
+		if m.Status != manifestConfirmed || m.ConfirmedBy != key {
+			return fmt.Errorf("%w: 确认记录（清单=%q 批次=%q）未被该清单标记", ErrCorrupt, cr.Manifest, cr.Batch)
+		}
+		b, ok := l.Batches[cr.Batch]
+		if !ok || b == nil {
+			return fmt.Errorf("%w: 确认记录引用了不存在的批次 %q", ErrCorrupt, cr.Batch)
+		}
+		if !b.Time.Equal(cr.Time) {
+			return fmt.Errorf("%w: 确认记录（清单=%q 批次=%q）的时间与批次出站时间不一致", ErrCorrupt, cr.Manifest, cr.Batch)
+		}
+		for _, pid := range cr.Parcels {
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 确认记录引用了不存在的包裹 %q", ErrCorrupt, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "出站" && e.Batch == cr.Batch {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 确认记录的成员包裹 %q 缺少批次 %q 的出站轨迹", ErrCorrupt, pid, cr.Batch)
+			}
+		}
+	}
+	// 取消请求：必须被其清单引用，且每件成员轨迹中有与该取消请求一致的取消预留记录。
+	for req, r := range l.ManifestCancels {
+		if r == nil || req != r.Request || r.Manifest == "" || r.Reason == "" ||
+			len(r.Parcels) == 0 || r.Time.IsZero() {
+			return fmt.Errorf("%w: 取消请求号 %q 的取消结果不完整", ErrCorrupt, req)
+		}
+		m, ok := l.Manifests[r.Manifest]
+		if !ok || m == nil {
+			return fmt.Errorf("%w: 取消请求 %q 引用了不存在的分拣清单 %q", ErrCorrupt, req, r.Manifest)
+		}
+		if m.Status != manifestCancelled || m.CancelledBy != req {
+			return fmt.Errorf("%w: 取消请求 %q 未被清单 %q 标记", ErrCorrupt, req, r.Manifest)
+		}
+		for _, pid := range r.Parcels {
+			p, ok := l.Parcels[pid]
+			if !ok {
+				return fmt.Errorf("%w: 取消请求 %q 引用了不存在的包裹 %q", ErrCorrupt, req, pid)
+			}
+			found := false
+			for _, e := range p.Trail {
+				if e.Op == "取消预留" && e.Request == req {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: 取消请求 %q 的成员包裹 %q 缺少对应的取消预留轨迹", ErrCorrupt, req, pid)
+			}
+		}
+	}
+	// 待出站预留的成员当前必须仍归属清单站点、状态为在站或异常冻结（预留期间允许冻结），
+	// 且其最后一条分拣预留之后不得有任何流转（冻结/解除冻结除外）；冻结必须仍未解除或
+	// 已解除都允许，但站点不变。终结清单不限制成员的后续合法作业。
+	for pid, no := range reservedBy {
+		p := l.Parcels[pid]
+		m := l.Manifests[no]
+		if p.Station != m.Station {
+			return fmt.Errorf("%w: 待出站清单 %q 的预留包裹 %q 当前归属 %q，不在清单站点 %q",
+				ErrCorrupt, no, pid, p.Station, m.Station)
+		}
+		switch p.Status {
+		case statusInStation, statusFrozen:
+		default:
+			return fmt.Errorf("%w: 待出站清单 %q 的预留包裹 %q 当前状态为 %q，应为在站或异常冻结",
+				ErrCorrupt, no, pid, p.Status)
+		}
+		// 找到该清单的分拣预留轨迹位置，其后只能有冻结/解除冻结/取消预留之外什么都不应有
+		// （取消只在终结时发生，待出站清单不会有）。
+		pos := -1
+		for i, e := range p.Trail {
+			if e.Op == "分拣预留" && e.Manifest == no {
+				pos = i
+			}
+		}
+		for _, e := range p.Trail[pos+1:] {
+			switch e.Op {
+			case "冻结", "解除冻结":
+			default:
+				return fmt.Errorf("%w: 待出站清单 %q 的预留包裹 %q 在预留之后发生了 %s 轨迹",
+					ErrCorrupt, no, pid, e.Op)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1647,6 +2031,9 @@ func (s *Store) Handoff(request, from, to string, parcels []string, now time.Tim
 		if p.Station != from {
 			return nil, false, fmt.Errorf("交接失败：包裹 %q 当前归属 %q，不属于源站点 %q，整次交接未执行", id, p.Station, from)
 		}
+		if rm := s.data.activeReservation(id); rm != nil {
+			return nil, false, fmt.Errorf("交接失败：%w", reservationError(id, rm, "整次交接未执行"))
+		}
 		if inc := activeFreeze(p); inc != "" {
 			return nil, false, fmt.Errorf("交接失败：包裹 %q 已被异常单 %q 冻结，冻结期间整批交接拒绝，整次交接未执行", id, inc)
 		}
@@ -1728,6 +2115,9 @@ func (s *Store) Return(request, handoffReq, reason string, now time.Time) (resul
 		p, ok := s.data.Parcels[id]
 		if !ok {
 			return nil, false, fmt.Errorf("退回失败：包裹 %q 未登记，整批退回未执行", id)
+		}
+		if rm := s.data.activeReservation(id); rm != nil {
+			return nil, false, fmt.Errorf("退回失败：%w", reservationError(id, rm, "整批退回未执行"))
 		}
 		if inc := activeFreeze(p); inc != "" {
 			return nil, false, fmt.Errorf("退回失败：包裹 %q 已被异常单 %q 冻结，冻结期间整批退回拒绝，整批退回未执行", id, inc)
@@ -1819,6 +2209,9 @@ func (s *Store) Dispatch(batch, station, courier string, parcels []string, now t
 		}
 		if p.Station != station {
 			return nil, false, fmt.Errorf("出站失败：包裹 %q 当前归属 %q，不在出发站 %q，整批出站未执行", id, p.Station, station)
+		}
+		if rm := s.data.activeReservation(id); rm != nil {
+			return nil, false, fmt.Errorf("出站失败：%w", reservationError(id, rm, "整批出站未执行"))
 		}
 		if inc := activeFreeze(p); inc != "" {
 			return nil, false, fmt.Errorf("出站失败：包裹 %q 已被异常单 %q 冻结，冻结期间整批出站拒绝，整批出站未执行", id, inc)
@@ -2758,6 +3151,9 @@ func (s *Store) Ship(shipment, from, to string, parcels []string, now time.Time)
 		if p.Station != from {
 			return nil, false, fmt.Errorf("发运失败：包裹 %q 当前归属 %q，不在源站 %q，整单发运未执行", id, p.Station, from)
 		}
+		if rm := s.data.activeReservation(id); rm != nil {
+			return nil, false, fmt.Errorf("发运失败：%w", reservationError(id, rm, "整单发运未执行"))
+		}
 		if p.Status != statusInStation {
 			return nil, false, fmt.Errorf("发运失败：包裹 %q 当前状态为 %q，不是在站，整单发运未执行", id, p.Status)
 		}
@@ -3047,6 +3443,284 @@ func (s *Store) Reroute(request, shipment, expect, to, reason string, now time.T
 	return res, false, nil
 }
 
+// CreateManifest 创建一张配送出站前的分拣清单并整单预留成员。
+//
+// 首次创建：每件包裹必须已登记、在指定站点在站，且未被其他待出站清单预留；
+// 任一不符整单拒绝、不作任何改动（冻结件、配送中、在途或已签收件同样不满足）。
+// 成功时按首次提交顺序永久保存成员并整单预留，站点、状态不变；每件追加一条含清单号、
+// 站点和时间的分拣预留管理记录。预留与取消只是管理记录，不移动实物、不算新流转。
+// 待出站成员不能首次交接、退回、发运、直接 dispatch 或加入另一清单（涉及它的批量操作
+// 整批拒绝）；允许冻结与解除，预留保留。
+// 清单号独立于其他业务编号，终结（已出站/已取消）后不复用：相同清单号且站点、包裹集合
+// （与顺序无关）相同，直接返回首次成员顺序与创建时间，replayed 为 true，不检查现状、
+// 不重新预留、不追加轨迹或改写文件（终结后重放仍成立）；清单号相同但站点或集合不同
+// 报冲突；失败的首次创建不占用清单号。
+func (s *Store) CreateManifest(manifest, station string, parcels []string, now time.Time) (res *SortManifest, replayed bool, err error) {
+	if saved, ok := s.data.Manifests[manifest]; ok {
+		if saved.Station == station && sameSet(saved.Parcels, parcels) {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("分拣清单号 %q 已用于一次不同的清单创建（站点=%q），内容冲突；清单号终结后也不能复用",
+			manifest, saved.Station)
+	}
+
+	// 首次创建：先做全部校验，任何一件不满足都整单拒绝。
+	for _, id := range parcels {
+		p, ok := s.data.Parcels[id]
+		if !ok {
+			return nil, false, fmt.Errorf("清单创建失败：包裹 %q 未登记，整单创建未执行", id)
+		}
+		if p.Station != station || p.Status != statusInStation {
+			return nil, false, fmt.Errorf("清单创建失败：包裹 %q 当前归属 %q、状态 %q，不在站点 %q 在站，整单创建未执行",
+				id, p.Station, p.Status, station)
+		}
+		if rm := s.data.activeReservation(id); rm != nil {
+			return nil, false, fmt.Errorf("清单创建失败：包裹 %q 已被分拣清单 %q 整单预留（待出站），不能加入另一清单，整单创建未执行",
+				id, rm.Manifest)
+		}
+	}
+
+	res = &SortManifest{
+		Manifest: manifest,
+		Station:  station,
+		Parcels:  append([]string(nil), parcels...),
+		Time:     now,
+		Status:   manifestPending,
+	}
+	s.data.Manifests[manifest] = res
+
+	// 记录旧值，落盘失败时整体回滚。站点、状态不变，只逐件追加分拣预留管理记录。
+	prev := make(map[string][]Event, len(parcels))
+	for _, id := range parcels {
+		p := s.data.Parcels[id]
+		prev[id] = append([]Event(nil), p.Trail...)
+		p.Trail = append(p.Trail, Event{
+			Op:       "分拣预留",
+			Station:  station,
+			Manifest: manifest,
+			Time:     now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.Manifests, manifest)
+		for id, old := range prev {
+			s.data.Parcels[id].Trail = old
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// ConfirmManifest 整单确认一张待出站分拣清单出站：按清单原顺序创建普通配送批次、
+// 释放预留，清单永久标记已出站。
+//
+// 首次确认：清单必须存在且为待出站；批次号必须从未被出站或续接使用；全部成员必须仍在
+// 清单站点在站且仍由本清单预留；任一成员已冻结（异常冻结）导致整单拒绝。任一不符整单
+// 拒绝、不作任何改动。成功时按原顺序以给定批次号与配送员创建普通配送批次，成员转为
+// “配送中”（站点仍记清单站点），各追加一条普通出站记录；清单永久标记已出站。
+// 之后的配送作业（回执、中止、续接、退件等）照常，dispatch 可用同一批次号按原内容重放。
+// 同清单、同批次、同配送员重复确认返回首次结果与时间，replayed 为 true，不检查现状、
+// 不追加轨迹或改写文件；换批次或配送员报冲突。确认与取消竞争至多一方成功。
+func (s *Store) ConfirmManifest(manifest, batch, courier string, now time.Time) (res *ManifestConfirmResult, replayed bool, err error) {
+	m, ok := s.data.Manifests[manifest]
+	if !ok {
+		return nil, false, fmt.Errorf("确认失败：分拣清单号 %q 不存在", manifest)
+	}
+	// 去重判定以（清单号、批次号）为身份；已终结清单的同批次重放同样在此返回。
+	key := manifestConfirmKey(manifest, batch)
+	if saved, exists := s.data.ManifestConfirms[key]; exists {
+		if saved.Courier == courier {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("分拣清单 %q 的批次 %q 已用于配送员 %q 的确认出站，配送员 %q 内容冲突",
+			manifest, batch, saved.Courier, courier)
+	}
+	// 同一清单换一个新批次号确认：终结后拒绝（不占用新批次号）。
+	if m.ConfirmedBy != "" {
+		cr := s.data.ManifestConfirms[m.ConfirmedBy]
+		return nil, false, fmt.Errorf("确认失败：分拣清单 %q 已出站（批次号 %q、配送员 %q），清单终结后不能再次确认",
+			manifest, cr.Batch, cr.Courier)
+	}
+	if m.CancelledBy != "" {
+		return nil, false, fmt.Errorf("确认失败：分拣清单 %q 已取消（取消请求号 %q），不能确认出站", manifest, m.CancelledBy)
+	}
+	if _, used := s.data.Batches[batch]; used {
+		return nil, false, fmt.Errorf("确认失败：配送批次号 %q 已被出站或续接使用，不能复用", batch)
+	}
+
+	// 先做全部校验：成员必须仍在清单站点在站、仍由本清单预留，冻结件整单拒绝。
+	for _, id := range m.Parcels {
+		p := s.data.Parcels[id] // 清单成员必已登记（载入校验保证）
+		if rm := s.data.activeReservation(id); rm == nil || rm.Manifest != manifest {
+			return nil, false, fmt.Errorf("确认失败：包裹 %q 已不由分拣清单 %q 预留，整单确认未执行", id, manifest)
+		}
+		if p.Station != m.Station {
+			return nil, false, fmt.Errorf("确认失败：包裹 %q 当前归属 %q，不在清单站点 %q，整单确认未执行", id, p.Station, m.Station)
+		}
+		if inc := activeFreeze(p); inc != "" {
+			return nil, false, fmt.Errorf("确认失败：包裹 %q 已被异常单 %q 冻结，冻结件导致整单拒绝，整单确认未执行", id, inc)
+		}
+		if p.Status != statusInStation {
+			return nil, false, fmt.Errorf("确认失败：包裹 %q 当前状态为 %q，不是在站，整单确认未执行", id, p.Status)
+		}
+	}
+
+	res = &ManifestConfirmResult{
+		Manifest: manifest,
+		Batch:    batch,
+		Courier:  courier,
+		Parcels:  append([]string(nil), m.Parcels...),
+		Station:  m.Station,
+		Time:     now,
+	}
+	s.data.ManifestConfirms[key] = res
+	s.data.Batches[batch] = &BatchResult{
+		Batch:    batch,
+		Station:  m.Station,
+		Courier:  courier,
+		Parcels:  append([]string(nil), m.Parcels...),
+		Time:     now,
+		Receipts: map[string]*ReceiptEntry{},
+	}
+	m.Status = manifestConfirmed
+	m.ConfirmedBy = key // 预留随之释放：清单不再待出站
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string]struct {
+		status string
+		trail  []Event
+	}, len(m.Parcels))
+	for _, id := range m.Parcels {
+		p := s.data.Parcels[id]
+		prev[id] = struct {
+			status string
+			trail  []Event
+		}{p.Status, append([]Event(nil), p.Trail...)}
+		p.Status = statusDelivering // 站点不变，仍记清单站点
+		p.Trail = append(p.Trail, Event{
+			Op:      "出站",
+			Station: m.Station,
+			Batch:   batch,
+			Courier: courier,
+			Time:    now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.ManifestConfirms, key)
+		delete(s.data.Batches, batch)
+		m.Status = manifestPending
+		m.ConfirmedBy = ""
+		for id, old := range prev {
+			p := s.data.Parcels[id]
+			p.Status = old.status
+			p.Trail = old.trail
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// CancelManifest 取消一张待出站分拣清单：整单释放预留、清单永久标记已取消。
+//
+// 只能取消待出站清单：取消不改变站点、状态，也不解除冻结（冻结件随清单一起取消预留，
+// 冻结保持）。成功时每件追加一条含清单号、取消请求号、原因、站点和时间的取消预留
+// 管理记录；取消只是管理记录，不算新流转，取消后无新流转时仍可退回原本可退回的交接。
+// 取消请求号独立去重，可与清单号、批次号及其他业务编号同名：相同取消请求号且清单、
+// 清理后的原因相同，直接返回首次结果与时间，replayed 为 true，不检查现状、不追加轨迹
+// 或改写文件；请求号相同但清单或原因不同报冲突。换取消请求号再次取消同一清单拒绝
+// （只能取消待出站清单）。确认与取消竞争至多一方成功；失败的首次取消不占用请求号。
+func (s *Store) CancelManifest(request, manifest, reason string, now time.Time) (res *ManifestCancelResult, replayed bool, err error) {
+	if saved, ok := s.data.ManifestCancels[request]; ok {
+		if saved.Manifest == manifest && saved.Reason == reason {
+			return saved, true, nil
+		}
+		return nil, false, fmt.Errorf("取消请求号 %q 已用于一次不同的清单取消（清单=%q 原因=%q），内容冲突",
+			request, saved.Manifest, saved.Reason)
+	}
+
+	m, ok := s.data.Manifests[manifest]
+	if !ok {
+		return nil, false, fmt.Errorf("取消失败：分拣清单号 %q 不存在", manifest)
+	}
+	if m.ConfirmedBy != "" {
+		cr := s.data.ManifestConfirms[m.ConfirmedBy]
+		return nil, false, fmt.Errorf("取消失败：分拣清单 %q 已出站（批次号 %q），只能取消待出站清单", manifest, cr.Batch)
+	}
+	if m.CancelledBy != "" {
+		return nil, false, fmt.Errorf("取消失败：分拣清单 %q 已取消（取消请求号 %q），每张清单只能取消一次", manifest, m.CancelledBy)
+	}
+
+	res = &ManifestCancelResult{
+		Request:  request,
+		Manifest: manifest,
+		Reason:   reason,
+		Parcels:  append([]string(nil), m.Parcels...),
+		Station:  m.Station,
+		Time:     now,
+	}
+	s.data.ManifestCancels[request] = res
+	m.Status = manifestCancelled
+	m.CancelledBy = request // 整单释放预留：清单不再待出站；站点、状态、冻结均不变
+
+	// 记录旧值，落盘失败时整体回滚。
+	prev := make(map[string][]Event, len(m.Parcels))
+	for _, id := range m.Parcels {
+		p := s.data.Parcels[id]
+		prev[id] = append([]Event(nil), p.Trail...)
+		p.Trail = append(p.Trail, Event{
+			Op:       "取消预留",
+			Station:  m.Station,
+			Manifest: manifest,
+			Request:  request,
+			Reason:   reason,
+			Time:     now,
+		})
+	}
+
+	if err := s.save(); err != nil {
+		delete(s.data.ManifestCancels, request)
+		m.Status = manifestPending
+		m.CancelledBy = ""
+		for id, old := range prev {
+			s.data.Parcels[id].Trail = old
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+// ManifestQuery 按清单号返回分拣清单；清单不存在时报错。
+func (s *Store) ManifestQuery(manifest string) (*SortManifest, error) {
+	m, ok := s.data.Manifests[manifest]
+	if !ok {
+		return nil, fmt.Errorf("分拣清单 %q 不存在", manifest)
+	}
+	return m, nil
+}
+
+// ManifestConfirmOf 返回某清单已出站时的确认结果；待出站或已取消时返回 nil。
+func (s *Store) ManifestConfirmOf(m *SortManifest) *ManifestConfirmResult {
+	if m == nil || m.ConfirmedBy == "" {
+		return nil
+	}
+	return s.data.ManifestConfirms[m.ConfirmedBy]
+}
+
+// ManifestCancelOf 返回某清单的取消结果；未取消时返回 nil。
+func (s *Store) ManifestCancelOf(m *SortManifest) *ManifestCancelResult {
+	if m == nil || m.CancelledBy == "" {
+		return nil
+	}
+	return s.data.ManifestCancels[m.CancelledBy]
+}
+
+// ActiveManifest 返回一件包裹当前预留它的待出站分拣清单；未被预留时返回 nil。
+func (s *Store) ActiveManifest(id string) *SortManifest {
+	return s.data.activeReservation(id)
+}
+
 // effectiveTo 返回运输单当前有效目的站：原目的站按保存顺序应用全部改址后的结果。
 // 载入校验保证改址列表引用的请求均存在且链式衔接，这里不做错误处理。
 func (s *Store) effectiveTo(sh *ShipmentResult) string {
@@ -3172,12 +3846,36 @@ func activeFreeze(p *Parcel) string {
 	return ""
 }
 
+// activeReservation 返回一件包裹当前被预留的待出站分拣清单；未被预留返回 nil。
+// 当前预留由状态为“待出站”的清单成员唯一推导（载入校验保证不重复预留）。
+func (l *ledgerFile) activeReservation(id string) *SortManifest {
+	for _, m := range l.Manifests {
+		if m == nil || m.Status != manifestPending {
+			continue
+		}
+		for _, pid := range m.Parcels {
+			if pid == id {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+// reservationError 生成涉及预留包裹的批量操作的统一拒绝信息。actionDesc 为
+// “整次交接未执行”等整批拒绝尾句。
+func reservationError(id string, m *SortManifest, actionDesc string) error {
+	return fmt.Errorf("包裹 %q 已被分拣清单 %q 整单预留（待出站），预留期间不能进行该操作，%s",
+		id, m.Manifest, actionDesc)
+}
+
 // lastFlowEvent 返回轨迹中最后一条真实流转记录（交接/退回/出站/回执/收回/续接/撤销回执/发运/接收）。
-// 冻结与解除只是管理记录，不算新流转，判定旧交接可否退回时须跳过它们。
+// 冻结、解除与分拣预留、取消预留只是管理记录，不算新流转：判定旧交接可否退回时须跳过它们，
+// 因此清单取消后若无新流转，原本可退回的交接仍可整批退回。
 func lastFlowEvent(trail []Event) Event {
 	for i := len(trail) - 1; i >= 0; i-- {
 		switch trail[i].Op {
-		case "冻结", "解除冻结":
+		case "冻结", "解除冻结", "分拣预留", "取消预留":
 			continue
 		default:
 			return trail[i]
